@@ -77,13 +77,13 @@ uring_drive_channel::uring_drive_channel(UringDriveInterface* iface) : m_sched{&
     using namespace std::placeholders;
     m_ring_ev_iodev = iomanager.generic_interface()->make_io_device(
         ev_fd, EPOLLIN, 0, nullptr, true, std::bind(&UringDriveInterface::on_event_notification, iface, _1, _2, _3));
-    iomanager.this_reactor()->attach_iomgr_sentinel_cb([iface]() { iface->poll_completions(); });
+    m_sentinel_idx = iomanager.this_reactor()->attach_iomgr_sentinel_cb([iface]() { iface->poll_completions(); });
 }
 
 uring_drive_channel::~uring_drive_channel() {
     io_uring_queue_exit(&m_ring);
     if (m_ring_ev_iodev != nullptr) {
-        iomanager.this_reactor()->detach_iomgr_sentinel_cb();
+        iomanager.this_reactor()->detach_iomgr_sentinel_cb(m_sentinel_idx);
         iomanager.generic_interface()->remove_io_device(m_ring_ev_iodev, true /* wait_to_remove */);
     }
 }

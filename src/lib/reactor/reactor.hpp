@@ -26,6 +26,7 @@
 
 namespace iomgr {
 using poll_cb_idx_t = uint32_t;
+using sentinel_cb_idx_t = uint32_t;
 using can_backoff_cb_t = std::function< bool(class IOReactor*) >;
 
 #define REACTOR_LOG(level, __l, ...)                                                                                   \
@@ -168,8 +169,11 @@ public:
     void unregister_poll_interval_cb(const poll_cb_idx_t idx);
     IOThreadMetrics& thread_metrics() { return *(m_metrics.get()); }
     void add_backoff_cb(can_backoff_cb_t&& cb);
-    void attach_iomgr_sentinel_cb(const listen_sentinel_cb_t& cb);
-    void detach_iomgr_sentinel_cb();
+    // Multiple interfaces (drive, net, ...) can each attach their own per-tick sentinel; every attached
+    // callback fires once per reactor loop iteration. Keep the returned idx and pass it to
+    // detach_iomgr_sentinel_cb to remove only that one registration.
+    sentinel_cb_idx_t attach_iomgr_sentinel_cb(const listen_sentinel_cb_t& cb);
+    void detach_iomgr_sentinel_cb(const sentinel_cb_idx_t idx);
     virtual void handle_msg(iomgr_msg* msg);
 
 protected:
@@ -213,6 +217,6 @@ protected:
     std::vector< can_backoff_cb_t > m_can_backoff_cbs;
     uint64_t m_cur_backoff_delay_us{0};
     uint64_t m_backoff_delay_min_us{0};
-    listen_sentinel_cb_t m_iomgr_sentinel_cb;
+    std::vector< listen_sentinel_cb_t > m_iomgr_sentinel_cbs;
 };
 } // namespace iomgr
