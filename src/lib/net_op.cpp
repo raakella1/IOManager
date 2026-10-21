@@ -58,7 +58,19 @@ io_result try_send(int fd, std::span< uint8_t const > buf) {
     }
 }
 
-bool is_retryable(io_result const& r) {
+accept_result try_accept(int fd) {
+    for (;;) {
+        int const r = ::accept(fd, nullptr, nullptr);
+        if (r >= 0) { return accept_result{r}; }
+        // ECONNABORTED: the peer reset the connection between its SYN completing and accept() picking it
+        // up -- retry rather than fail the whole listener over one aborted connection.
+        if (errno == EINTR || errno == ECONNABORTED) { continue; }
+        return accept_result{std::unexpected(std::error_code{errno, std::system_category()}.default_error_condition())};
+    }
+}
+
+template < typename T >
+bool is_retryable(std::expected< T, std::error_condition > const& r) {
     return !r.has_value() &&
         (r.error() == std::errc::resource_unavailable_try_again || r.error() == std::errc::operation_would_block);
 }
@@ -122,10 +134,36 @@ struct net_op::impl {
     }
 };
 
+// ----- listener_handle -------------------------------------------------------------------------------
+struct listener_handle::impl {
+    int fd{-1};
+    IOReactor* reactor{nullptr};
+    exec::async_scope scope;
+    accept_op::impl* parked_accept{nullptr};
+};
+
+// ----- accept_op: opaque awaitable wrapping a single accept -------------------------------------------
+struct accept_op::impl {
+    listener_handle::impl* owner{nullptr};
+    accept_result result{-1};
+    bool done{false};
+    std::coroutine_handle<> waiter{};
+
+    accept_result try_once() const { return try_accept(owner->fd); }
+
+    ~impl() {
+        RELEASE_ASSERT(owner->parked_accept != this,
+                       "accept_op destroyed while still parked waiting on its listener_handle -- would leave "
+                       "a dangling pointer the next completion would touch");
+    }
+};
+
 namespace {
 
-// Clears the parked slot and resumes its waiter with `r`.
-void complete_parked(net_op::impl*& slot, io_result r) {
+// Clears the parked slot and resumes its waiter with `r`. Shared by net_op::impl (io_result) and
+// accept_op::impl (accept_result) -- both have the same owner/result/done/waiter shape.
+template < typename Impl, typename Result >
+void complete_parked(Impl*& slot, Result r) {
     auto* const op = std::exchange(slot, nullptr);
     op->result = std::move(r);
     op->done = true;
@@ -190,6 +228,54 @@ void teardown(socket_handle::impl& s) {
     ::close(s.fd);
 }
 
+// Mirrors run_uring_op's shape for a single one-shot IORING_OP_ACCEPT.
+exec::task< void > run_uring_accept(accept_op::impl* self) {
+    struct cancel_guard {
+        accept_op::impl* self;
+        bool completed{false};
+        ~cancel_guard() {
+            if (completed) { return; }
+            accept_op::impl*& slot = self->owner->parked_accept;
+            if (slot == self) {
+                complete_parked(slot,
+                                accept_result{std::unexpected(std::make_error_condition(std::errc::connection_aborted))});
+            }
+        }
+    } guard{self};
+
+    auto& sched = UringNetInterface::this_channel()->m_sched;
+    int const res = co_await sched.async_submit(
+        [self](::io_uring_sqe* sqe) { ::io_uring_prep_accept(sqe, self->owner->fd, nullptr, nullptr, 0); });
+
+    accept_op::impl*& slot = self->owner->parked_accept;
+    if (slot == self) {
+        if (res < 0) {
+            complete_parked(slot, accept_result{std::unexpected(
+                                      std::error_code{-res, std::system_category()}.default_error_condition())});
+        } else {
+            complete_parked(slot, accept_result{res});
+        }
+    }
+    guard.completed = true;
+}
+
+// Mirrors teardown(socket_handle::impl&) for the single parked-accept case.
+void teardown(listener_handle::impl& s) {
+    if (s.parked_accept) {
+        s.scope.request_stop();
+        auto* const ch = UringNetInterface::this_channel();
+        auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (s.parked_accept) {
+            ch->m_sched.poll_once(std::chrono::milliseconds{1});
+            if (std::chrono::steady_clock::now() > deadline) {
+                LOGERRORMOD(iomgr, "Timed out cancelling a parked accept during listener teardown, fd={}", s.fd);
+                break;
+            }
+        }
+    }
+    ::close(s.fd);
+}
+
 } // namespace
 
 socket_handle::socket_handle(int fd, thread_specifier const& reactor) : _impl{std::make_unique< impl >()} {
@@ -226,6 +312,74 @@ socket_handle& socket_handle::operator=(socket_handle&& o) noexcept {
 }
 
 int socket_handle::fd() const noexcept { return _impl->fd; }
+
+listener_handle::listener_handle(int listen_fd, thread_specifier const& reactor) : _impl{std::make_unique< impl >()} {
+    RELEASE_ASSERT(std::holds_alternative< IOReactor* >(reactor),
+                   "listener_handle must be pinned to a specific reactor, not a reactor_regex");
+    auto* const target = std::get< IOReactor* >(reactor);
+    set_nonblocking(listen_fd);
+    impl* const p = _impl.get();
+    run_on_reactor(target, [listen_fd, target, p]() {
+        p->fd = listen_fd;
+        p->reactor = target;
+    });
+}
+
+listener_handle::~listener_handle() {
+    if (!_impl) { return; } // moved-from
+    impl* const p = _impl.get();
+    run_on_reactor(p->reactor, [p]() { teardown(*p); });
+}
+
+listener_handle::listener_handle(listener_handle&&) noexcept = default;
+
+listener_handle& listener_handle::operator=(listener_handle&& o) noexcept {
+    if (this != &o) {
+        if (_impl) {
+            impl* const p = _impl.get();
+            run_on_reactor(p->reactor, [p]() { teardown(*p); });
+        }
+        _impl = std::move(o._impl);
+    }
+    return *this;
+}
+
+int listener_handle::fd() const noexcept { return _impl->fd; }
+
+// ----- accept_op -----------------------------------------------------------------------------------
+accept_op::accept_op(std::unique_ptr< impl > p) noexcept : _impl{std::move(p)} {}
+accept_op::accept_op(accept_op&&) noexcept = default;
+accept_op& accept_op::operator=(accept_op&&) noexcept = default;
+accept_op::~accept_op() = default;
+
+bool accept_op::await_ready() const noexcept {
+    impl* const p = _impl.get();
+    RELEASE_ASSERT(iomanager.this_reactor() == p->owner->reactor,
+                   "accept_op driven from a thread other than its listener_handle's owning reactor");
+    auto r = p->try_once();
+    if (is_retryable(r)) { return false; }
+    p->result = std::move(r);
+    p->done = true;
+    return true;
+}
+
+void accept_op::await_suspend(std::coroutine_handle<> h) noexcept {
+    impl* const p = _impl.get();
+    RELEASE_ASSERT(p->owner->parked_accept == nullptr,
+                   "a second accept is already parked on this listener_handle -- callers must serialize "
+                   "their own accept loop");
+    p->waiter = h;
+    p->owner->parked_accept = p;
+    p->owner->scope.spawn(run_uring_accept(p));
+}
+
+accept_result accept_op::await_resume() const noexcept { return _impl->result; }
+
+accept_op async_accept(listener_handle& listener) {
+    auto p = std::make_unique< accept_op::impl >();
+    p->owner = listener._impl.get();
+    return accept_op{std::move(p)};
+}
 
 // ----- net_op -------------------------------------------------------------------------------------
 net_op::net_op(std::unique_ptr< impl > p) noexcept : _impl{std::move(p)} {}
