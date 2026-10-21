@@ -35,6 +35,7 @@
 #include "epoll/iomgr_impl_epoll.hpp"
 #include "interfaces/drive_iocb.hpp"
 #include "interfaces/uring_drive_interface.hpp"
+#include "interfaces/uring_net_interface.hpp"
 #include "iomgr_helper.hpp"
 #include "iomgr_config.hpp"
 #include "iomgr_timer_impl.hpp"
@@ -103,6 +104,12 @@ void IOManager::start(const iomgr_params& params, const thread_state_notifier_t&
     set_state(iomgr_state::interface_init);
     m_default_general_iface = std::make_shared< GenericIOInterface >();
     add_interface(m_default_general_iface);
+
+    // net_op's io_uring channel: unlike the drive interface below, this isn't gated on
+    // m_is_uring_capable/iface_adder -- iomgr already hard-requires io_uring to start at all (no
+    // libaio fallback), so sockets can assume it unconditionally too.
+    m_default_net_iface = std::make_shared< UringNetInterface >();
+    add_interface(m_default_net_iface);
 
     if (iface_adder) {
         iface_adder();
@@ -195,6 +202,7 @@ void IOManager::stop() {
         m_yet_to_start_nreactors.set(0);
         // m_expected_ifaces = inbuilt_interface_count;
         m_default_general_iface.reset();
+        m_default_net_iface.reset();
         m_drive_ifaces.clear();
         m_iface_list.clear();
     } catch (const std::exception& e) { LOGCRITICAL_AND_FLUSH("Caught exception {} during clear lists", e.what()); }

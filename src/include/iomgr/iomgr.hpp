@@ -82,6 +82,7 @@ public:
     // Reach the internal generic_interface() through the iomanager singleton (friendship isn't inherited,
     // so DriveInterface's friendship doesn't cover these):
     friend class uring_drive_channel; // per-reactor uring queue: registers its eventfd iodevice
+    friend class uring_net_channel;   // per-reactor net uring queue: registers its eventfd iodevice
     friend class timer_epoll;         // arms/cancels its timer fds
 
     static IOManager& instance() {
@@ -362,6 +363,7 @@ private:
     std::vector< std::shared_ptr< DriveInterface > > m_drive_ifaces;
 
     std::shared_ptr< GenericIOInterface > m_default_general_iface;
+    std::shared_ptr< IOInterface > m_default_net_iface;
 
     sisl::ActiveOnlyThreadBuffer< std::shared_ptr< IOReactor > > m_reactors;
 
