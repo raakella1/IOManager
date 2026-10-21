@@ -164,6 +164,26 @@ TEST_F(NetOpTest, RecvZeroIsEof) {
     EXPECT_EQ(*result, 0u);
 }
 
+// Complements RecvZeroIsEof: that one covers the read-side EOF signal (a clean 0-byte recv). This covers
+// the write side failing outright once the peer is gone -- MSG_NOSIGNAL turns what would otherwise be a
+// process-killing SIGPIPE into an ordinary error result, same as the raw-syscall fast path.
+TEST_F(NetOpTest, SendFailsWhenPeerClosed) {
+    auto const [fd0, fd1] = make_connected_pair();
+    ::close(fd1); // peer gone before the send is even attempted
+    std::array< uint8_t, 5 > const payload{'h', 'e', 'l', 'l', 'o'};
+    io_result result{0};
+
+    iomanager.run_on_wait(reactor_regex::random_worker, [&]() {
+        socket_handle sock(fd0, thread_specifier{iomanager.this_reactor()});
+        result = sisl::async::sync_get(
+            [](socket_handle& s, std::span< uint8_t const > buf) -> sisl::async::light_task< io_result > {
+                co_return co_await async_send(s, buf);
+            }(sock, std::span< uint8_t const >(payload)));
+    });
+
+    ASSERT_FALSE(result.has_value());
+}
+
 TEST_F(NetOpTest, RecvSuspendsUntilDataArrives) {
     auto const [fd0, fd1] = make_connected_pair();
     auto* const reactor = pick_a_worker_reactor();
@@ -519,6 +539,52 @@ TEST_F(NetOpTest, ConnectTimesOut) {
     ::close(client_fd);
 }
 
+// All prior tests exercise one or two sockets at a time. This exercises many socket_handles pinned to the
+// SAME reactor recv'ing concurrently, to build confidence the shared per-reactor ring actually
+// disambiguates completions correctly by user_data under real multiplexing rather than just in isolation
+// -- the scenario the whole "hundreds of connections on one reactor" design point is about.
+TEST_F(NetOpTest, ManyConcurrentRecvsOnOneReactorDontCrossTalk) {
+    constexpr int kNumSockets = 32;
+    auto* const reactor = pick_a_worker_reactor();
+
+    std::vector< int > peer_fds(kNumSockets);
+    std::vector< std::optional< socket_handle > > socks(kNumSockets);
+    std::vector< std::vector< uint8_t > > payloads(kNumSockets);
+    std::vector< std::vector< uint8_t > > read_bufs(kNumSockets);
+
+    for (int i = 0; i < kNumSockets; ++i) {
+        auto const [fd0, fd1] = make_connected_pair();
+        peer_fds[i] = fd1;
+        socks[i].emplace(fd0, thread_specifier{reactor});
+        payloads[i] = std::vector< uint8_t >(256, static_cast< uint8_t >(i));
+        read_bufs[i] = std::vector< uint8_t >(256);
+    }
+
+    std::vector< std::future< io_result > > futs;
+    futs.reserve(kNumSockets);
+    for (int i = 0; i < kNumSockets; ++i) {
+        futs.push_back(start< io_result >(
+            reactor, [&, i]() { return recv_exact(*socks[i], std::span< uint8_t >(read_bufs[i])); }));
+    }
+    // All kNumSockets recvs are now parked concurrently on the same reactor's ring before any data
+    // arrives. Writing from the peer side afterward (order doesn't matter -- the kernel buffers each
+    // independently) is what actually forces all of them to complete via uring, not the fast path.
+    for (int i = 0; i < kNumSockets; ++i) {
+        ASSERT_EQ(::write(peer_fds[i], payloads[i].data(), payloads[i].size()),
+                  static_cast< ssize_t >(payloads[i].size()));
+    }
+
+    for (int i = 0; i < kNumSockets; ++i) {
+        auto const r = futs[i].get();
+        ASSERT_TRUE(r.has_value()) << "socket " << i;
+        EXPECT_EQ(read_bufs[i], payloads[i]) << "socket " << i << " got cross-talked data";
+    }
+
+    for (int fd : peer_fds) {
+        ::close(fd);
+    }
+}
+
 // Deliberately not a NetOpTest fixture: this exercises what happens when a caller does NOT follow
 // socket_handle's documented contract ("destruction must run before the owning reactor stops"), so it
 // needs to control iomanager's start/stop itself rather than share NetOpTest::TearDown's single stop().
@@ -555,6 +621,62 @@ TEST(NetOpReactorStopTest, CancelsOutstandingRecvInstead) {
     EXPECT_FALSE(result.has_value());
     ::close(fd1);
     ::close(fd0);
+}
+
+// Same drain path as CancelsOutstandingRecvInstead, but for a parked accept and a parked (no-timeout)
+// connect -- drain_outstanding_ops() cancels the whole ring in one shot rather than per-handle, so it
+// needs to actually cover every op kind, not just recv.
+TEST(NetOpReactorStopTest, CancelsOutstandingAcceptAndConnectInstead) {
+    ioenvironment.with_iomgr(iomgr_params{.num_threads = 2});
+    IOReactor* reactor{nullptr};
+    iomanager.run_on_wait(reactor_regex::random_worker, [&reactor]() { reactor = iomanager.this_reactor(); });
+
+    auto const [listen_fd, path] = make_listening_socket();
+    // Heap-allocated and deliberately leaked, same reasoning as CancelsOutstandingRecvInstead: its
+    // destructor would try to dispatch onto `reactor`, which is about to stop.
+    auto* const listener = new listener_handle(listen_fd, thread_specifier{reactor});
+
+    accept_result accept_res{-1};
+    bool accept_completed{false};
+    iomanager.run_on_wait(reactor, [&]() {
+        [](listener_handle& l, accept_result& out, bool& done) -> sisl::async::light_task< void > {
+            out = co_await async_accept(l);
+            done = true;
+        }(*listener, accept_res, accept_completed)
+                                                                      .detach();
+    });
+    ASSERT_FALSE(accept_completed);
+
+    // Same TEST-NET-1 target as ConnectTimesOut, with no timeout: genuinely still pending (not resolved
+    // by its own timeout) by the time stop() runs below.
+    int const client_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(client_fd, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(80);
+    ASSERT_EQ(::inet_pton(AF_INET, "192.0.2.1", &addr.sin_addr), 1);
+
+    std::expected< void, std::error_condition > connect_res;
+    bool connect_completed{false};
+    iomanager.run_on_wait(reactor, [&]() {
+        [](int fd, sockaddr_in a, IOReactor* r, std::expected< void, std::error_condition >& out,
+           bool& done) -> sisl::async::light_task< void > {
+            out = co_await async_connect(fd, reinterpret_cast< sockaddr* >(&a), sizeof(a), thread_specifier{r});
+            done = true;
+        }(client_fd, addr, reactor, connect_res, connect_completed)
+                                                                      .detach();
+    });
+    ASSERT_FALSE(connect_completed);
+
+    iomanager.stop(); // must cancel both, not hang
+
+    EXPECT_TRUE(accept_completed);
+    EXPECT_FALSE(accept_res.has_value());
+    EXPECT_TRUE(connect_completed);
+    EXPECT_FALSE(connect_res.has_value());
+
+    ::close(client_fd);
+    ::unlink(path.c_str());
 }
 
 int main(int argc, char* argv[]) {

@@ -105,9 +105,17 @@ void IOManager::start(const iomgr_params& params, const thread_state_notifier_t&
     m_default_general_iface = std::make_shared< GenericIOInterface >();
     add_interface(m_default_general_iface);
 
-    // net_op's io_uring channel: unlike the drive interface below, this isn't gated on
-    // m_is_uring_capable/iface_adder -- iomgr already hard-requires io_uring to start at all (no
-    // libaio fallback), so sockets can assume it unconditionally too.
+    // net_op's io_uring channel. Checked explicitly here (not only inside the `else` below, which an
+    // iface_adder bypasses): a custom iface_adder legitimately lets a caller swap in a different drive
+    // backend without going through the hard-require-io_uring check below, but net_op has no non-uring
+    // backend at all -- letting this run unconditionally on a non-uring-capable system would surface as
+    // an uncaught io_uring_queue_init_params failure deep inside reactor startup instead of a clear
+    // upfront error.
+    if (!m_is_uring_capable) {
+        throw std::runtime_error(
+            "iomgr requires io_uring for net_op: the system is not io_uring-capable (or drive.disable_io_uring "
+            "is set)");
+    }
     m_default_net_iface = std::make_shared< UringNetInterface >();
     add_interface(m_default_net_iface);
 

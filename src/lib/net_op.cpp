@@ -101,6 +101,19 @@ io_result res_to_io_result(int res) {
     return io_result{static_cast< size_t >(res)};
 }
 
+// io_uring_scheduler::async_submit's sender completes via set_error(exception_ptr) (not a negative `res`)
+// when the ring is exhausted even after an internal flush-and-retry (see acquire_sqe/ENOMEM in
+// io_uring_scheduler.hpp) -- a real possibility under load, not a hypothetical, at this queue depth.
+// exec::task's co_await rethrows that into the caller, and exec::async_scope's spawn() is explicitly not
+// built to handle a spawned sender that fails this way ("BUGBUG NOT TO SPEC spawn shouldn't accept
+// senders that can fail" in its own vendored source) -- so this must never be allowed to propagate past
+// the co_await that can throw it. Every submission coroutine below wraps its own co_await in a
+// try/catch(std::exception const&) and maps the caught exception through this.
+std::error_condition exception_to_error_condition(std::exception const& e) {
+    if (auto const* se = dynamic_cast< std::system_error const* >(&e)) { return se->code().default_error_condition(); }
+    return std::make_error_condition(std::errc::not_enough_memory);
+}
+
 // Outstanding accounting + tight-poll while a net op is in flight, mirroring UringDriveInterface's
 // io_started()/io_finished(): lets UringNetInterface's reactor-stop drain know when it's safe to tear the
 // ring down, and keeps completions flushing promptly while anything is outstanding.
@@ -234,13 +247,25 @@ exec::task< void > run_uring_op(net_op::impl* self) {
     } guard{self};
 
     auto& sched = UringNetInterface::this_channel()->m_sched;
-    int const res = co_await sched.async_submit([self](::io_uring_sqe* sqe) {
-        if (self->is_send) {
-            ::io_uring_prep_send(sqe, self->owner->fd, self->send_buf.data(), self->send_buf.size(), MSG_NOSIGNAL);
-        } else {
-            ::io_uring_prep_recv(sqe, self->owner->fd, self->recv_buf.data(), self->recv_buf.size(), 0);
+    int res = 0;
+    for (;;) {
+        try {
+            res = co_await sched.async_submit([self](::io_uring_sqe* sqe) {
+                if (self->is_send) {
+                    ::io_uring_prep_send(sqe, self->owner->fd, self->send_buf.data(), self->send_buf.size(),
+                                         MSG_NOSIGNAL);
+                } else {
+                    ::io_uring_prep_recv(sqe, self->owner->fd, self->recv_buf.data(), self->recv_buf.size(), 0);
+                }
+            });
+        } catch (std::exception const& e) {
+            net_op::impl*& slot = self->is_send ? self->owner->parked_send : self->owner->parked_recv;
+            if (slot == self) { complete_parked(slot, io_result{std::unexpected(exception_to_error_condition(e))}); }
+            guard.completed = true;
+            co_return;
         }
-    });
+        if (res != -EINTR) { break; } // interrupted by a signal, not "no data" -- retry transparently
+    }
 
     net_op::impl*& slot = self->is_send ? self->owner->parked_send : self->owner->parked_recv;
     if (slot == self) { complete_parked(slot, res_to_io_result(res)); }
@@ -286,8 +311,24 @@ exec::task< void > run_uring_accept(accept_op::impl* self) {
     } guard{self};
 
     auto& sched = UringNetInterface::this_channel()->m_sched;
-    int const res = co_await sched.async_submit(
-        [self](::io_uring_sqe* sqe) { ::io_uring_prep_accept(sqe, self->owner->fd, nullptr, nullptr, 0); });
+    int res = 0;
+    for (;;) {
+        try {
+            res = co_await sched.async_submit(
+                [self](::io_uring_sqe* sqe) { ::io_uring_prep_accept(sqe, self->owner->fd, nullptr, nullptr, 0); });
+        } catch (std::exception const& e) {
+            accept_op::impl*& slot = self->owner->parked_accept;
+            if (slot == self) {
+                complete_parked(slot, accept_result{std::unexpected(exception_to_error_condition(e))});
+            }
+            guard.completed = true;
+            co_return;
+        }
+        // ECONNABORTED: the peer reset the connection between its SYN completing and accept() picking it
+        // up -- retry rather than fail the whole listener over one aborted connection, same reasoning as
+        // the raw-syscall fast path in try_accept.
+        if (res != -EINTR && res != -ECONNABORTED) { break; }
+    }
 
     accept_op::impl*& slot = self->owner->parked_accept;
     if (slot == self) {
@@ -353,18 +394,32 @@ exec::task< void > run_uring_connect(connect_op::impl* self, int fd, sockaddr_st
         ts.tv_sec = static_cast< __kernel_time64_t >(ns / 1'000'000'000);
         ts.tv_nsec = static_cast< long long >(ns % 1'000'000'000);
     }
-    int const res = co_await ch->m_sched.async_submit([&](::io_uring_sqe* sqe) {
-        ::io_uring_prep_connect(sqe, fd, reinterpret_cast< sockaddr const* >(&addr), addrlen);
-        if (timeout) {
-            if (auto* const timeout_sqe = ::io_uring_get_sqe(ch->m_sched.ring())) {
-                sqe->flags |= IOSQE_IO_LINK;
-                ::io_uring_prep_link_timeout(timeout_sqe, &ts, 0);
-                ::io_uring_sqe_set_data64(timeout_sqe, 0);
-            } else {
-                LOGWARNMOD(iomgr, "net uring ring full: connect timeout not armed for this call");
+    int res = 0;
+    try {
+        res = co_await ch->m_sched.async_submit([&](::io_uring_sqe* sqe) {
+            ::io_uring_prep_connect(sqe, fd, reinterpret_cast< sockaddr const* >(&addr), addrlen);
+            if (timeout) {
+                if (auto* const timeout_sqe = ::io_uring_get_sqe(ch->m_sched.ring())) {
+                    sqe->flags |= IOSQE_IO_LINK;
+                    ::io_uring_prep_link_timeout(timeout_sqe, &ts, 0);
+                    ::io_uring_sqe_set_data64(timeout_sqe, 0);
+                } else {
+                    LOGWARNMOD(iomgr, "net uring ring full: connect timeout not armed for this call");
+                }
             }
+        });
+    } catch (std::exception const& e) {
+        // Not retried (unlike recv/send/accept): connect has no EINTR-safe resubmission path -- a second
+        // connect() on a fd that may already be mid-handshake risks the same EALREADY net_op.hpp's
+        // await_ready documents for why there's no raw-syscall fast path here either.
+        if (!self->done) {
+            self->result = std::unexpected(exception_to_error_condition(e));
+            self->done = true;
+            if (auto w = self->waiter) { w.resume(); }
         }
-    });
+        guard.completed = true;
+        co_return;
+    }
 
     if (!self->done) {
         self->result = (res < 0)
