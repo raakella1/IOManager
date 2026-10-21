@@ -196,10 +196,6 @@ struct connect_op::impl {
     connect_result result{};
     bool done{false};
     std::coroutine_handle<> waiter{};
-    // Purely a vehicle for spawn() (no hand-rolled receiver, see run_uring_op's comment) -- nothing ever
-    // calls request_stop() on this directly. Cancellation, when requested, comes from the kernel-side
-    // linked timeout in run_uring_connect, not from this scope.
-    exec::async_scope scope;
 };
 
 namespace {
@@ -491,30 +487,19 @@ connect_op::connect_op(connect_op&&) noexcept = default;
 connect_op& connect_op::operator=(connect_op&&) noexcept = default;
 connect_op::~connect_op() = default;
 
-// A non-blocking ::connect() to an already-reachable peer (loopback in particular) can complete
-// synchronously, same "don't pay for the ring if you don't have to" reasoning as net_op/accept_op's fast
-// path. EINPROGRESS is the normal "started, ask again later" case -- fall through to the uring path below.
-bool connect_op::await_ready() const noexcept {
-    impl* const p = _impl.get();
-    for (;;) {
-        int const r = ::connect(p->fd, reinterpret_cast< sockaddr const* >(&p->addr), p->addrlen);
-        if (r == 0) {
-            p->result = impl::connect_result{};
-            p->done = true;
-            return true;
-        }
-        if (errno == EINTR) { continue; }
-        if (errno == EINPROGRESS) { return false; } // suspend into the uring path in await_suspend
-        p->result = std::unexpected(std::error_code{errno, std::system_category()}.default_error_condition());
-        p->done = true;
-        return true;
-    }
-}
+// Unlike recv/send/accept, connect has no safe fast path: trying a raw non-blocking ::connect() first
+// (as those do) would itself start the handshake (that's what EINPROGRESS means -- the kernel is now
+// actively connecting), and a *second* connect -- including IORING_OP_CONNECT's own internal connect()
+// syscall -- on an already-connecting fd is rejected outright with EALREADY, confirmed empirically. So
+// IORING_OP_CONNECT must be the only connect() call ever made on this fd; go straight to the uring
+// submission every time. A connect that completes quickly (loopback in particular) still resolves fast
+// this way, just via one ring round trip rather than zero.
+bool connect_op::await_ready() const noexcept { return false; }
 
 void connect_op::await_suspend(std::coroutine_handle<> h) noexcept {
     impl* const p = _impl.get();
     p->waiter = h;
-    p->scope.spawn(run_uring_connect(p, p->fd, p->addr, p->addrlen, p->timeout));
+    UringNetInterface::this_channel()->m_scope.spawn(run_uring_connect(p, p->fd, p->addr, p->addrlen, p->timeout));
 }
 
 std::expected< void, std::error_condition > connect_op::await_resume() const noexcept { return _impl->result; }

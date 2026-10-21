@@ -26,6 +26,7 @@
 #include <liburing.h>
 #include <sys/eventfd.h>
 
+#include <exec/async_scope.hpp>
 #include <sisl/async/io_uring_scheduler.hpp>
 
 #include "io_interface.hpp" // IOInterface (internal)
@@ -45,6 +46,13 @@ struct uring_net_channel {
     uint32_t m_sentinel_idx{0};
     uint64_t m_outstanding{0};     // in-flight net ops on this reactor
     int m_saved_poll_interval{-1}; // reactor poll interval captured while tight-polling outstanding IO
+    // connect_op has no owning handle of its own (unlike socket_handle/listener_handle) to host a scope
+    // that outlives any single call, so its run_uring_connect task spawns into this channel-level one
+    // instead -- long-lived for the reactor's whole life, so resuming a connect's waiter (which may
+    // immediately destroy the connect_op) can never race the scope's own self-destruction the way a
+    // per-call scope owned by connect_op::impl itself would (confirmed by hitting exec::async_scope's
+    // "__active_ == 0" destructor assertion with that approach).
+    exec::async_scope m_scope;
 
     uring_net_channel(UringNetInterface* iface);
     ~uring_net_channel();
