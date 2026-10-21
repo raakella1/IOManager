@@ -158,6 +158,24 @@ struct accept_op::impl {
     }
 };
 
+// ----- connect_op: opaque awaitable wrapping a single outbound connect ---------------------------------
+struct connect_op::impl {
+    using connect_result = std::expected< void, std::error_condition >;
+
+    int fd{-1};
+    sockaddr_storage addr{};
+    socklen_t addrlen{0};
+    std::optional< std::chrono::milliseconds > timeout;
+
+    connect_result result{};
+    bool done{false};
+    std::coroutine_handle<> waiter{};
+    // Purely a vehicle for spawn() (no hand-rolled receiver, see run_uring_op's comment) -- nothing ever
+    // calls request_stop() on this directly. Cancellation, when requested, comes from the kernel-side
+    // linked timeout in run_uring_connect, not from this scope.
+    exec::async_scope scope;
+};
+
 namespace {
 
 // Clears the parked slot and resumes its waiter with `r`. Shared by net_op::impl (io_result) and
@@ -276,6 +294,63 @@ void teardown(listener_handle::impl& s) {
     ::close(s.fd);
 }
 
+// One-shot IORING_OP_CONNECT, optionally linked (IOSQE_IO_LINK) to an IORING_OP_LINK_TIMEOUT so the
+// kernel itself cancels the connect if it fires first -- rather than racing a second sender/coroutine
+// against this one, which would need to keep touching `self` after this task (and the connect_op it
+// belongs to) may already be gone. The timeout SQE's own completion is irrelevant here, so its user_data
+// is left 0 ("unmanaged"), same convention submit_op's own cancel-on-stop path uses: poll_once's reap
+// loop skips any CQE whose user_data isn't one of its own managed cqe_states.
+//
+// addr/ts are coroutine-frame locals (addr a parameter, ts local), not references to caller-owned
+// storage: the kernel reads them at actual submission time, deferred to the next poll_once, not at this
+// prep call -- same hazard as drive's own legacy iovec path. The frame stays alive across the suspend,
+// so this is safe.
+exec::task< void > run_uring_connect(connect_op::impl* self, int fd, sockaddr_storage addr, socklen_t addrlen,
+                                     std::optional< std::chrono::milliseconds > timeout) {
+    // The kernel-side linked timeout above is the only source of cancellation for a connect_op in this
+    // design (nothing ever calls self->scope.request_stop()) -- so if co_await below completes via the
+    // stopped channel instead of resuming past it, it can only be that timeout firing first.
+    struct cancel_guard {
+        connect_op::impl* self;
+        bool completed{false};
+        ~cancel_guard() {
+            if (completed) { return; }
+            self->result = std::unexpected(std::make_error_condition(std::errc::timed_out));
+            self->done = true;
+            if (auto w = self->waiter) { w.resume(); }
+        }
+    } guard{self};
+
+    auto* const ch = UringNetInterface::this_channel();
+    __kernel_timespec ts{};
+    if (timeout) {
+        auto const ns = std::chrono::duration_cast< std::chrono::nanoseconds >(*timeout).count();
+        ts.tv_sec = static_cast< __kernel_time64_t >(ns / 1'000'000'000);
+        ts.tv_nsec = static_cast< long long >(ns % 1'000'000'000);
+    }
+    int const res = co_await ch->m_sched.async_submit([&](::io_uring_sqe* sqe) {
+        ::io_uring_prep_connect(sqe, fd, reinterpret_cast< sockaddr const* >(&addr), addrlen);
+        if (timeout) {
+            if (auto* const timeout_sqe = ::io_uring_get_sqe(ch->m_sched.ring())) {
+                sqe->flags |= IOSQE_IO_LINK;
+                ::io_uring_prep_link_timeout(timeout_sqe, &ts, 0);
+                ::io_uring_sqe_set_data64(timeout_sqe, 0);
+            } else {
+                LOGWARNMOD(iomgr, "net uring ring full: connect timeout not armed for this call");
+            }
+        }
+    });
+
+    if (!self->done) {
+        self->result = (res < 0)
+            ? std::unexpected(std::error_code{-res, std::system_category()}.default_error_condition())
+            : connect_op::impl::connect_result{};
+        self->done = true;
+        if (auto w = self->waiter) { w.resume(); }
+    }
+    guard.completed = true;
+}
+
 } // namespace
 
 socket_handle::socket_handle(int fd, thread_specifier const& reactor) : _impl{std::make_unique< impl >()} {
@@ -379,6 +454,57 @@ accept_op async_accept(listener_handle& listener) {
     auto p = std::make_unique< accept_op::impl >();
     p->owner = listener._impl.get();
     return accept_op{std::move(p)};
+}
+
+// ----- connect_op -----------------------------------------------------------------------------------
+connect_op::connect_op(std::unique_ptr< impl > p) noexcept : _impl{std::move(p)} {}
+connect_op::connect_op(connect_op&&) noexcept = default;
+connect_op& connect_op::operator=(connect_op&&) noexcept = default;
+connect_op::~connect_op() = default;
+
+// A non-blocking ::connect() to an already-reachable peer (loopback in particular) can complete
+// synchronously, same "don't pay for the ring if you don't have to" reasoning as net_op/accept_op's fast
+// path. EINPROGRESS is the normal "started, ask again later" case -- fall through to the uring path below.
+bool connect_op::await_ready() const noexcept {
+    impl* const p = _impl.get();
+    for (;;) {
+        int const r = ::connect(p->fd, reinterpret_cast< sockaddr const* >(&p->addr), p->addrlen);
+        if (r == 0) {
+            p->result = impl::connect_result{};
+            p->done = true;
+            return true;
+        }
+        if (errno == EINTR) { continue; }
+        if (errno == EINPROGRESS) { return false; } // suspend into the uring path in await_suspend
+        p->result = std::unexpected(std::error_code{errno, std::system_category()}.default_error_condition());
+        p->done = true;
+        return true;
+    }
+}
+
+void connect_op::await_suspend(std::coroutine_handle<> h) noexcept {
+    impl* const p = _impl.get();
+    p->waiter = h;
+    p->scope.spawn(run_uring_connect(p, p->fd, p->addr, p->addrlen, p->timeout));
+}
+
+std::expected< void, std::error_condition > connect_op::await_resume() const noexcept { return _impl->result; }
+
+connect_op async_connect(int fd, sockaddr const* addr, socklen_t addrlen, thread_specifier const& reactor,
+                         std::optional< std::chrono::milliseconds > timeout) {
+    RELEASE_ASSERT(std::holds_alternative< IOReactor* >(reactor),
+                   "async_connect must be called with a specific reactor, not a reactor_regex");
+    RELEASE_ASSERT(iomanager.this_reactor() == std::get< IOReactor* >(reactor),
+                   "async_connect driven from a thread other than the reactor it was called with");
+    RELEASE_ASSERT(static_cast< size_t >(addrlen) <= sizeof(sockaddr_storage),
+                   "addrlen {} exceeds sizeof(sockaddr_storage)", addrlen);
+    set_nonblocking(fd);
+    auto p = std::make_unique< connect_op::impl >();
+    p->fd = fd;
+    std::memcpy(&p->addr, addr, addrlen);
+    p->addrlen = addrlen;
+    p->timeout = timeout;
+    return connect_op{std::move(p)};
 }
 
 // ----- net_op -------------------------------------------------------------------------------------

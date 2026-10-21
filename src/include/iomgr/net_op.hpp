@@ -13,13 +13,19 @@
  **************************************************************************/
 #pragma once
 
+#include <chrono>
 #include <coroutine>
 #include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <system_error>
+
+extern "C" {
+#include <sys/socket.h> // sockaddr, socklen_t
+}
 
 #include <sisl/async/light_task.hpp>
 
@@ -148,5 +154,40 @@ private:
 };
 
 accept_op async_accept(listener_handle& listener);
+
+// Bare, handle-less awaitable for a single outbound connect -- unlike socket_handle/listener_handle,
+// there's no persistent owner to cancel this through: a connect happens once per fd, not repeatedly, so
+// there's nothing to serialize or tear down. Same opaque PIMPL shape as net_op/accept_op otherwise.
+class connect_op {
+public:
+    struct impl;
+
+    explicit connect_op(std::unique_ptr< impl > p) noexcept;
+    connect_op(connect_op&&) noexcept;
+    connect_op& operator=(connect_op&&) noexcept;
+    connect_op(connect_op const&) = delete;
+    connect_op& operator=(connect_op const&) = delete;
+    ~connect_op();
+
+    bool await_ready() const noexcept;
+    void await_suspend(std::coroutine_handle<> h) noexcept;
+    std::expected< void, std::error_condition > await_resume() const noexcept;
+
+private:
+    std::unique_ptr< impl > _impl;
+};
+
+// Connects `fd` (already created via ::socket(), not yet connected) to addr/addrlen on `reactor`, backed
+// by a one-shot IORING_OP_CONNECT. Async for the same reason accept is: a stalled peer can leave a
+// blocking ::connect() hanging for a long time (Linux's default connect timeout is on the order of 100+
+// seconds), stalling every other coroutine sharing the issuing reactor thread -- a real problem at
+// hundreds-of-connections scale with reconnect logic, not a hypothetical one.
+//
+// Unlike recv/send/accept, there's no owning handle whose teardown could cancel this on the caller's
+// behalf, so `timeout` is the only way to bound the wait: it arms a linked IORING_OP_LINK_TIMEOUT,
+// surfacing as std::errc::timed_out if it fires first. Omitting it waits indefinitely, same as
+// accept/recv/send today.
+connect_op async_connect(int fd, sockaddr const* addr, socklen_t addrlen, thread_specifier const& reactor,
+                         std::optional< std::chrono::milliseconds > timeout = std::nullopt);
 
 } // namespace iomgr
