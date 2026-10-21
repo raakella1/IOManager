@@ -66,6 +66,11 @@ public:
 private:
     void init_iface_reactor_context(IOReactor*) override;
     void clear_iface_reactor_context(IOReactor*) override;
+    // Reactor stop: actively cancel everything still in flight on this channel's ring (unlike disk I/O, a
+    // parked accept/recv/connect can wait forever for an external event that will never come once this
+    // reactor is stopping, so passively waiting for "outstanding == 0" the way drive's drain does is not
+    // safe here), then drive poll_once until every cancellation has landed.
+    void drain_outstanding_ops();
 
 private:
     static thread_local uring_net_channel* t_uring_net_ch;

@@ -14,6 +14,7 @@
 #include "interfaces/uring_net_interface.hpp"
 #include <iomgr/iomgr.hpp>
 
+#include <chrono>
 #include <system_error>
 
 #ifdef __linux__
@@ -86,13 +87,38 @@ void UringNetInterface::init_iface_reactor_context(IOReactor*) {
 }
 
 void UringNetInterface::clear_iface_reactor_context(IOReactor*) {
-    // No net ops exist yet (scaffolding-only chunk), so there is nothing outstanding to drain here.
-    // Once socket/listener/connect ops land, this needs to actively cancel anything still in flight
-    // before tearing the ring down -- unlike disk I/O, a parked accept/recv can wait forever if the
-    // peer never sends/connects, so passively waiting for "outstanding == 0" is not safe here.
     if (t_uring_net_ch != nullptr) {
+        drain_outstanding_ops();
         delete t_uring_net_ch;
         t_uring_net_ch = nullptr;
+    }
+}
+
+void UringNetInterface::drain_outstanding_ops() {
+    if (t_uring_net_ch->m_outstanding == 0) { return; }
+
+    // Cancel everything still in flight on this ring in one shot, rather than tracking down each
+    // socket_handle/listener_handle/connect_op's own async_scope individually: IORING_ASYNC_CANCEL_ANY
+    // ignores the normal user_data/fd matching key, and IORING_ASYNC_CANCEL_ALL cancels every matching
+    // request instead of just the first. This cancel's own completion is irrelevant, so its user_data is
+    // left 0 ("unmanaged"), same convention the per-op cancel-on-stop path uses -- poll_once's reap loop
+    // skips any CQE whose user_data isn't one of its own managed cqe_states. Each individual op's own
+    // CQE still arrives as -ECANCELED and resolves through its normal completion path, decrementing
+    // m_outstanding the same way a normal completion would.
+    if (auto* const sqe = ::io_uring_get_sqe(t_uring_net_ch->m_sched.ring())) {
+        ::io_uring_prep_cancel64(sqe, 0, IORING_ASYNC_CANCEL_ANY | IORING_ASYNC_CANCEL_ALL);
+        ::io_uring_sqe_set_data64(sqe, 0);
+    }
+
+    using namespace std::chrono;
+    auto const deadline = steady_clock::now() + seconds{5};
+    while (t_uring_net_ch->m_outstanding > 0) {
+        t_uring_net_ch->m_sched.poll_once(milliseconds{1});
+        if (steady_clock::now() > deadline) {
+            LOGERRORMOD(iomgr, "Timed out cancelling {} outstanding net uring ops at reactor stop",
+                        t_uring_net_ch->m_outstanding);
+            break;
+        }
     }
 }
 

@@ -33,6 +33,7 @@ extern "C" {
 #include <iomgr/iomgr.hpp>
 #include <iomgr/net_op.hpp>
 #include "interfaces/uring_net_interface.hpp"
+#include "reactor/reactor.hpp"
 
 namespace iomgr {
 
@@ -99,6 +100,31 @@ io_result res_to_io_result(int res) {
     }
     return io_result{static_cast< size_t >(res)};
 }
+
+// Outstanding accounting + tight-poll while a net op is in flight, mirroring UringDriveInterface's
+// io_started()/io_finished(): lets UringNetInterface's reactor-stop drain know when it's safe to tear the
+// ring down, and keeps completions flushing promptly while anything is outstanding.
+void net_io_started() {
+    auto* const ch = UringNetInterface::this_channel();
+    if (ch->m_outstanding++ == 0) {
+        ch->m_saved_poll_interval = iomanager.this_reactor()->get_poll_interval();
+        iomanager.this_reactor()->set_poll_interval(0);
+    }
+}
+
+void net_io_finished() {
+    auto* const ch = UringNetInterface::this_channel();
+    if (--ch->m_outstanding == 0) { iomanager.this_reactor()->set_poll_interval(ch->m_saved_poll_interval); }
+}
+
+// Constructed first (incremented first) / destroyed last (decremented last) relative to each coroutine's
+// own cancel_guard, so m_outstanding only reaches zero once the op is fully resolved -- including the
+// cancellation-path resolution a cancel_guard's own destructor may still need to run.
+struct net_io_scope {
+    net_io_scope() { net_io_started(); }
+    net_io_scope(net_io_scope const&) = delete;
+    ~net_io_scope() { net_io_finished(); }
+};
 
 } // namespace
 
@@ -198,6 +224,7 @@ void complete_parked(Impl*& slot, Result r) {
 // it would during a normal stack unwind, and resolves the parked op as cancelled if nothing else already
 // did.
 exec::task< void > run_uring_op(net_op::impl* self) {
+    net_io_scope io_scope;
     struct cancel_guard {
         net_op::impl* self;
         bool completed{false};
@@ -248,6 +275,7 @@ void teardown(socket_handle::impl& s) {
 
 // Mirrors run_uring_op's shape for a single one-shot IORING_OP_ACCEPT.
 exec::task< void > run_uring_accept(accept_op::impl* self) {
+    net_io_scope io_scope;
     struct cancel_guard {
         accept_op::impl* self;
         bool completed{false};
@@ -307,6 +335,7 @@ void teardown(listener_handle::impl& s) {
 // so this is safe.
 exec::task< void > run_uring_connect(connect_op::impl* self, int fd, sockaddr_storage addr, socklen_t addrlen,
                                      std::optional< std::chrono::milliseconds > timeout) {
+    net_io_scope io_scope;
     // The kernel-side linked timeout above is the only source of cancellation for a connect_op in this
     // design (nothing ever calls self->scope.request_stop()) -- so if co_await below completes via the
     // stopped channel instead of resuming past it, it can only be that timeout firing first.
