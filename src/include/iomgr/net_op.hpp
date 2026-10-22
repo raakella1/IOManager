@@ -42,6 +42,14 @@ class accept_op;
 // own send loop. Every net_op call on a handle must run on the reactor it was constructed on, for the
 // handle's whole life, except construction and destruction: those may run on any thread (they hop onto the
 // target/owning reactor themselves), since teardown can legitimately be triggered from another thread.
+//
+// Every live socket_handle (and listener_handle) MUST be destroyed before its owning reactor stops.
+// Destruction hops onto that reactor to run teardown, the same as construction; once the reactor has
+// actually stopped, there is nothing left to hop onto. This is not merely slow or a leak -- confirmed
+// empirically under stress testing, it can corrupt the reactor object the dispatch reaches for mid-
+// teardown ("pure virtual method called" is the typical symptom), not just hang. Callers that manage many
+// handles should track and explicitly release them before calling IOManager::stop(), the same way timers
+// and other per-reactor resources already must be.
 class socket_handle {
 public:
     struct impl;
@@ -49,7 +57,8 @@ public:
     // Registers fd on the given reactor. Safe to call from any thread.
     socket_handle(int fd, thread_specifier const& reactor);
     // Cancels any parked waiter (waiting for the kernel's confirmation before touching the fd further),
-    // fails it with connection_aborted, then closes fd. Safe to call from any thread.
+    // fails it with connection_aborted, then closes fd. Safe to call from any thread -- but only while the
+    // owning reactor is still running; see the class comment above.
     ~socket_handle();
     socket_handle(socket_handle&&) noexcept;
     socket_handle& operator=(socket_handle&&) noexcept;
@@ -110,7 +119,8 @@ sisl::async::light_task< io_result > recv_exact(socket_handle& sock, std::span< 
 sisl::async::light_task< io_result > send_all(socket_handle& sock, std::span< uint8_t const > buf);
 
 // Owns one listening fd's reactor registration for its whole life, mirroring socket_handle. Holds at most
-// one parked accept waiter; construction and destruction may run on any thread, same as socket_handle.
+// one parked accept waiter; construction and destruction may run on any thread, same as socket_handle --
+// and the same "destroy before the owning reactor stops" requirement applies; see socket_handle's comment.
 class listener_handle {
 public:
     struct impl;

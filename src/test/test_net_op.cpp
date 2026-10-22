@@ -154,6 +154,55 @@ TEST(NetOpCustomQdepthTest, ExplicitOverrideStillWorks) {
     iomanager.stop();
 }
 
+// A deliberately adversarial stress case for the queue-depth knob itself: 100 sockets concurrently
+// submitting into a ring configured for a depth of only 2. Confirmed empirically (not just by reading
+// io_uring_scheduler's acquire_sqe) that this does NOT reproduce genuine ring exhaustion: acquire_sqe's
+// own flush-and-retry runs per op, sequentially, so each new submission's retry already makes room before
+// the next one is even requested -- an ordinary burst self-heals this way regardless of how small the
+// configured depth is. Kept as a permanent regression check that an extreme depth/concurrency mismatch
+// at least never regresses into a crash or a hang, even though it can't exercise the true-exhaustion
+// error path (that remains verified by code reading only; see net_op.cpp's exception_to_error_condition).
+TEST(NetOpRingPressureTest, ManyConcurrentOpsOnATinyRingAllResolve) {
+    ioenvironment.with_iomgr(iomgr_params{.num_threads = 1, .net_uring_qdepth = 2});
+    auto* const reactor = pick_a_worker_reactor();
+
+    constexpr int kNumSockets = 100;
+    std::vector< int > peer_fds(kNumSockets);
+    std::vector< std::optional< socket_handle > > socks(kNumSockets);
+    std::vector< std::vector< uint8_t > > read_bufs(kNumSockets, std::vector< uint8_t >(16));
+
+    for (int i = 0; i < kNumSockets; ++i) {
+        auto const [fd0, fd1] = make_connected_pair();
+        peer_fds[i] = fd1;
+        socks[i].emplace(fd0, thread_specifier{reactor});
+    }
+
+    std::vector< std::future< io_result > > futs;
+    futs.reserve(kNumSockets);
+    for (int i = 0; i < kNumSockets; ++i) {
+        futs.push_back(start< io_result >(
+            reactor, [&, i]() { return async_recv(*socks[i], std::span< uint8_t >(read_bufs[i])); }));
+    }
+    for (int i = 0; i < kNumSockets; ++i) {
+        uint8_t const b = static_cast< uint8_t >(i);
+        ASSERT_EQ(::write(peer_fds[i], &b, 1), 1);
+    }
+
+    for (int i = 0; i < kNumSockets; ++i) {
+        auto const r = futs[i].get();
+        ASSERT_TRUE(r.has_value()) << "socket " << i << ": " << r.error().message();
+    }
+
+    // socket_handle destruction must happen before the reactor stops (see socket_handle's class
+    // comment) -- explicit here rather than relying on scope exit, since that would run after the
+    // iomanager.stop() below.
+    socks.clear();
+    for (int fd : peer_fds) {
+        ::close(fd);
+    }
+    iomanager.stop();
+}
+
 TEST_F(NetOpTest, RecvSendRoundTrip) {
     auto const [fd0, fd1] = make_connected_pair();
     std::array< uint8_t, 5 > const payload{'h', 'e', 'l', 'l', 'o'};

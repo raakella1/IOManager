@@ -446,7 +446,9 @@ socket_handle::socket_handle(int fd, thread_specifier const& reactor) : _impl{st
 }
 
 // Must run before the owning reactor stops: run_on_reactor's dispatch has nothing to deliver the message
-// to once that reactor's thread has exited, and would block forever.
+// to once that reactor's thread has exited. Confirmed under stress testing to actually corrupt the
+// (already-destructing) reactor object the dispatch reaches for, not just hang -- see net_op.hpp's class
+// comment.
 socket_handle::~socket_handle() {
     if (!_impl) { return; } // moved-from
     impl* const p = _impl.get();
@@ -480,6 +482,8 @@ listener_handle::listener_handle(int listen_fd, thread_specifier const& reactor)
     });
 }
 
+// Same "must run before the owning reactor stops" requirement as socket_handle::~socket_handle(); see
+// that destructor's comment.
 listener_handle::~listener_handle() {
     if (!_impl) { return; } // moved-from
     impl* const p = _impl.get();
