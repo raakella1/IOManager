@@ -73,6 +73,7 @@ void IOManager::start(const iomgr_params& params, const thread_state_notifier_t&
         m_num_workers = params.num_threads;
     }
     m_mem_size_limit = ((params.app_mem_size_mb == 0) ? get_app_mem_limit() : params.app_mem_size_mb) * Mi;
+    m_net_uring_qdepth = params.net_uring_qdepth;
 
     // Setup the app memory throttling
     m_mem_soft_threshold_size = IM_DYNAMIC_CONFIG(iomem.soft_mem_release_threshold) * m_mem_size_limit / 100;

@@ -63,6 +63,14 @@ ENUM(iomgr_state, uint16_t, stopped, interface_init, reactor_init, sys_init, run
 struct iomgr_params {
     size_t num_threads{0};
     uint32_t app_mem_size_mb{0};
+
+    // Per-reactor io_uring queue depth for net_op's socket ops (recv/send/accept/connect). 0 = use
+    // net.uring_per_thread_qdepth from dynamic config (default 256, sized for disk I/O's few-large-ops
+    // shape, not necessarily net's many-small-ops one). Size this explicitly rather than relying on that
+    // default: a socket_handle can hold up to one recv AND one send outstanding at once, so required
+    // headroom scales with concurrent connections *per reactor thread* (total connections / num_threads),
+    // not total connection count alone.
+    uint32_t net_uring_qdepth{0};
 };
 
 /**
@@ -355,6 +363,11 @@ private:
     sisl::atomic_counter< int16_t > m_yet_to_start_nreactors{0}; // Total number of iomanager threads yet to start
     sisl::atomic_counter< int16_t > m_yet_to_stop_nreactors{0};
     uint32_t m_num_workers{0};
+    // 0 = unset -- uring_net_channel falls back to the net.uring_per_thread_qdepth dynamic config default.
+    // Plain per-instance state (set fresh from iomgr_params on every start()), not a mutation of that
+    // dynamic config itself: the latter is process-wide singleton state that would otherwise leak this
+    // override into every later start() in the same process, tests included.
+    uint32_t m_net_uring_qdepth{0};
 
     std::unique_ptr< IOManagerImpl > m_impl;
 

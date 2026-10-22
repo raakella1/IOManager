@@ -29,7 +29,11 @@ namespace iomgr {
 thread_local uring_net_channel* UringNetInterface::t_uring_net_ch{nullptr};
 
 uring_net_channel::uring_net_channel(UringNetInterface* iface) : m_sched{&m_ring} {
-    auto const qdepth = IM_DYNAMIC_CONFIG(net.uring_per_thread_qdepth);
+    // iomgr_params::net_uring_qdepth (0 = unset) takes precedence over the dynamic config default: it's
+    // explicit per-instance state set fresh on every IOManager::start(), vs. the process-wide dynamic
+    // config singleton that a caller may not have touched at all for this workload shape.
+    auto const qdepth =
+        (iomanager.m_net_uring_qdepth != 0) ? iomanager.m_net_uring_qdepth : IM_DYNAMIC_CONFIG(net.uring_per_thread_qdepth);
 
     // See uring_drive_channel's constructor for the rationale on these flags -- same per-reactor,
     // single-submitter story applies here.

@@ -119,6 +119,41 @@ public:
     void TearDown() override { iomanager.stop(); }
 };
 
+// Confirms iomgr_params::net_uring_qdepth is actually wired through to the net channel's ring (not just
+// that the field exists), and that an explicit, intentionally-small-but-reasonable override doesn't break
+// ordinary operation. This does NOT attempt to exercise genuine ring exhaustion (an unflushable "still
+// full after acquire_sqe's own flush-and-retry" condition): acquire_sqe's retry runs per-op, sequentially,
+// so an ordinary burst of fast local socket I/O self-heals via that retry before ever reaching the
+// exhaustion path -- forcing the real thing would need the completion side backed up too, not just a
+// small SQ depth. That fix (net_op.cpp's try/catch around each uring submission) remains verified by
+// reading the code, not by a passing test here.
+TEST(NetOpCustomQdepthTest, ExplicitOverrideStillWorks) {
+    ioenvironment.with_iomgr(iomgr_params{.num_threads = 2, .net_uring_qdepth = 8});
+    auto const [fd0, fd1] = make_connected_pair();
+    std::array< uint8_t, 5 > const payload{'h', 'e', 'l', 'l', 'o'};
+    std::array< uint8_t, 5 > read_buf{};
+    io_result send_result{0};
+    io_result recv_result{0};
+
+    iomanager.run_on_wait(reactor_regex::random_worker, [&]() {
+        socket_handle a(fd0, thread_specifier{iomanager.this_reactor()});
+        socket_handle b(fd1, thread_specifier{iomanager.this_reactor()});
+        send_result = sisl::async::sync_get(
+            [](socket_handle& s, std::span< uint8_t const > buf) -> sisl::async::light_task< io_result > {
+                co_return co_await async_send(s, buf);
+            }(a, std::span< uint8_t const >(payload)));
+        recv_result = sisl::async::sync_get(
+            [](socket_handle& s, std::span< uint8_t > buf) -> sisl::async::light_task< io_result > {
+                co_return co_await async_recv(s, buf);
+            }(b, std::span< uint8_t >(read_buf)));
+    });
+
+    ASSERT_TRUE(send_result.has_value());
+    ASSERT_TRUE(recv_result.has_value());
+    EXPECT_EQ(read_buf, payload);
+    iomanager.stop();
+}
+
 TEST_F(NetOpTest, RecvSendRoundTrip) {
     auto const [fd0, fd1] = make_connected_pair();
     std::array< uint8_t, 5 > const payload{'h', 'e', 'l', 'l', 'o'};
