@@ -16,6 +16,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <future>
@@ -251,6 +252,32 @@ TEST_F(NetOpTest, RecvZeroIsEof) {
 // Complements RecvZeroIsEof: that one covers the read-side EOF signal (a clean 0-byte recv). This covers
 // the write side failing outright once the peer is gone -- MSG_NOSIGNAL turns what would otherwise be a
 // process-killing SIGPIPE into an ordinary error result, same as the raw-syscall fast path.
+// detach() (the fire-and-forget launcher for non-coroutine callers) had no coverage at all until this --
+// every other test drives net_op through a coroutine, via sisl::async::sync_get or a hand-written
+// light_task, never through detach()'s own callback-based path.
+TEST_F(NetOpTest, DetachInvokesCallbackOnCompletion) {
+    auto const [fd0, fd1] = make_connected_pair();
+    auto* const reactor = pick_a_worker_reactor();
+    socket_handle sock(fd0, thread_specifier{reactor});
+    std::array< uint8_t, 5 > read_buf{};
+
+    std::promise< io_result > result_promise;
+    auto result_fut = result_promise.get_future();
+    iomanager.run_on_wait(reactor, [&]() {
+        detach(async_recv(sock, std::span< uint8_t >(read_buf)),
+               [&result_promise](io_result r) { result_promise.set_value(std::move(r)); });
+    });
+    ASSERT_EQ(result_fut.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout); // parked
+
+    std::array< uint8_t, 5 > const payload{'h', 'e', 'l', 'l', 'o'};
+    ASSERT_EQ(::write(fd1, payload.data(), payload.size()), static_cast< ssize_t >(payload.size()));
+
+    auto const result = result_fut.get();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(read_buf, payload);
+    ::close(fd1);
+}
+
 TEST_F(NetOpTest, SendFailsWhenPeerClosed) {
     auto const [fd0, fd1] = make_connected_pair();
     ::close(fd1); // peer gone before the send is even attempted
@@ -669,6 +696,102 @@ TEST_F(NetOpTest, ManyConcurrentRecvsOnOneReactorDontCrossTalk) {
     }
 }
 
+// Complements ManyConcurrentRecvsOnOneReactorDontCrossTalk: that one has many connections on ONE ring,
+// proving user_data disambiguation. This has multiple rings on DIFFERENT reactor threads genuinely active
+// at the same time, proving there's no shared state (thread_local channel, sentinel registration, etc.)
+// that only happens to work when there's just one net channel involved.
+TEST_F(NetOpTest, ConcurrentActivityAcrossMultipleReactorsDoesntCrossTalk) {
+    auto reactors = two_distinct_worker_reactors();
+    ASSERT_GE(reactors.size(), 2u);
+
+    struct conn {
+        int peer_fd;
+        std::optional< socket_handle > sock;
+        std::vector< uint8_t > payload;
+        std::vector< uint8_t > read_buf;
+    };
+    constexpr int kPerReactor = 16;
+    std::vector< conn > conns(reactors.size() * kPerReactor);
+
+    for (size_t r = 0; r < reactors.size(); ++r) {
+        for (int i = 0; i < kPerReactor; ++i) {
+            auto& c = conns[r * kPerReactor + static_cast< size_t >(i)];
+            auto const [fd0, fd1] = make_connected_pair();
+            c.peer_fd = fd1;
+            c.sock.emplace(fd0, thread_specifier{reactors[r]});
+            c.payload = std::vector< uint8_t >(128, static_cast< uint8_t >(r * kPerReactor + static_cast< size_t >(i)));
+            c.read_buf = std::vector< uint8_t >(128);
+        }
+    }
+
+    std::vector< std::future< io_result > > futs;
+    futs.reserve(conns.size());
+    for (size_t r = 0; r < reactors.size(); ++r) {
+        for (int i = 0; i < kPerReactor; ++i) {
+            auto& c = conns[r * kPerReactor + static_cast< size_t >(i)];
+            futs.push_back(
+                start< io_result >(reactors[r], [&c]() { return recv_exact(*c.sock, std::span< uint8_t >(c.read_buf)); }));
+        }
+    }
+    for (auto& c : conns) {
+        ASSERT_EQ(::write(c.peer_fd, c.payload.data(), c.payload.size()), static_cast< ssize_t >(c.payload.size()));
+    }
+    for (size_t i = 0; i < conns.size(); ++i) {
+        auto const r = futs[i].get();
+        ASSERT_TRUE(r.has_value()) << "conn " << i;
+        EXPECT_EQ(conns[i].read_buf, conns[i].payload) << "conn " << i << " got cross-talked data";
+    }
+    for (auto& c : conns) {
+        ::close(c.peer_fd);
+    }
+}
+
+// "Multi-threaded hammering" doesn't mean racing multiple OS threads against one socket_handle -- that's
+// not a supported usage pattern (every op must run on the handle's owning reactor; see
+// NetOpDeathTest.SecondConcurrentRecvOnSameSocketAborts below for what happens if you try). What's
+// actually worth hammering is repetition: many cycles of parking-then-tearing-down and
+// parking-then-completing in quick succession, to give the cancel-vs-complete race in
+// run_uring_op/cancel_guard many chances to misbehave rather than just the one shot every other test
+// above gives it.
+TEST_F(NetOpTest, RepeatedTeardownDuringFlightDoesNotRaceOrLeak) {
+    auto* const reactor = pick_a_worker_reactor();
+    constexpr int kIterations = 200;
+    for (int iter = 0; iter < kIterations; ++iter) {
+        auto const [fd0, fd1] = make_connected_pair();
+        auto sock = std::make_unique< socket_handle >(fd0, thread_specifier{reactor});
+        std::array< uint8_t, 5 > read_buf{};
+
+        if (iter % 2 == 0) {
+            // Cancellation path: tear down while still genuinely parked (cancel_guard's destructor path).
+            io_result result{0};
+            bool completed{false};
+            iomanager.run_on_wait(reactor, [&]() {
+                [](socket_handle& s, std::span< uint8_t > buf, io_result& out,
+                   bool& done) -> sisl::async::light_task< void > {
+                    out = co_await async_recv(s, buf);
+                    done = true;
+                }(*sock, std::span< uint8_t >(read_buf), result, completed)
+                                                                                  .detach();
+            });
+            ASSERT_FALSE(completed) << "iter " << iter;
+            sock.reset(); // destroyed from this thread, still parked
+            ASSERT_TRUE(completed) << "iter " << iter;
+            ASSERT_FALSE(result.has_value()) << "iter " << iter;
+        } else {
+            // Normal-completion path: let it resolve naturally before tearing down (the post-co_await
+            // completion path in run_uring_op, with cancel_guard's destructor a no-op).
+            auto fut = start< io_result >(reactor, [&]() { return async_recv(*sock, std::span< uint8_t >(read_buf)); });
+            std::array< uint8_t, 5 > const payload{'h', 'e', 'l', 'l', 'o'};
+            ASSERT_EQ(::write(fd1, payload.data(), payload.size()), static_cast< ssize_t >(payload.size()))
+                << "iter " << iter;
+            auto const r = fut.get();
+            ASSERT_TRUE(r.has_value()) << "iter " << iter;
+            sock.reset(); // already resolved -- teardown here is the "nothing parked" fast path
+        }
+        ::close(fd1);
+    }
+}
+
 // Deliberately not a NetOpTest fixture: this exercises what happens when a caller does NOT follow
 // socket_handle's documented contract ("destruction must run before the owning reactor stops"), so it
 // needs to control iomanager's start/stop itself rather than share NetOpTest::TearDown's single stop().
@@ -761,6 +884,47 @@ TEST(NetOpReactorStopTest, CancelsOutstandingAcceptAndConnectInstead) {
 
     ::close(client_fd);
     ::unlink(path.c_str());
+}
+
+namespace {
+void trigger_second_concurrent_recv() {
+    ioenvironment.with_iomgr(iomgr_params{.num_threads = 1});
+    auto const [fd0, fd1] = make_connected_pair();
+    auto* const reactor = pick_a_worker_reactor();
+    socket_handle sock(fd0, thread_specifier{reactor});
+    std::array< uint8_t, 5 > buf1{};
+    std::array< uint8_t, 5 > buf2{};
+    iomanager.run_on_wait(reactor, [&]() {
+        // Both park on the same socket before either can complete (nothing is ever written) -- the
+        // second async_recv's await_suspend finds parked_recv already occupied.
+        [](socket_handle& s, std::span< uint8_t > b) -> sisl::async::light_task< void > {
+            co_await async_recv(s, b);
+        }(sock, std::span< uint8_t >(buf1))
+                                                .detach();
+        [](socket_handle& s, std::span< uint8_t > b) -> sisl::async::light_task< void > {
+            co_await async_recv(s, b);
+        }(sock, std::span< uint8_t >(buf2))
+                                                .detach();
+    });
+    ::close(fd1);
+}
+} // namespace
+
+// Verifies the protocol-violation guard actually fires rather than silently misbehaving: two logical recv
+// loops racing the same socket_handle concurrently (the realistic version of this bug -- a caller forgets
+// to serialize their own recv loop, or two code paths both think they own the same socket) must abort,
+// not corrupt the parked-pointer slot. "threadsafe" style: this process is multi-threaded (worker
+// reactors), and the default fork-only death test style is documented as unsafe there -- threadsafe
+// re-execs the whole test binary for the death-test statement instead of forking the live process.
+//
+// Matched on the termination signal (RELEASE_ASSERT calls abort(), raising SIGABRT), not the log message:
+// confirmed the actual assert fires (critical-level log for "a second recv is already parked" visible on
+// this run), but sisl's logging sink doesn't end up in the stream gtest's death-test runner captures and
+// matches regexes against, so text matching isn't reliable here. Signal matching only needs the process
+// to have actually died the expected way, not where its log output went.
+TEST(NetOpDeathTest, SecondConcurrentRecvOnSameSocketAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(trigger_second_concurrent_recv(), ::testing::KilledBySignal(SIGABRT), "");
 }
 
 int main(int argc, char* argv[]) {
