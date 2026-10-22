@@ -24,6 +24,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 extern "C" {
@@ -113,6 +114,59 @@ std::future< T > start(IOReactor* reactor, Fn&& fn) {
                                                                       .detach();
     });
     return fut;
+}
+
+// Repeatedly puts a disk write and a net recv outstanding on `reactor` at the same time, alternating
+// which one is let to resolve first across iterations, and checks the reactor's poll_interval is back to
+// `original_poll_interval` after every single cycle -- not just once, the way
+// ConcurrentDiskAndNetIODontCorruptReactorPollInterval does. The fix (IOReactor::enter_tight_poll/
+// exit_tight_poll) is a plain ref count, which should be correct for any interleaving or ordering by
+// construction -- this is what actually puts that claim to the test across many interleavings instead of
+// trusting it from the one ordering that originally exposed the bug. Safe to call from any thread (used
+// both directly and from worker threads driving multiple reactors in parallel); every local is
+// thread-local to this call, and gtest assertions are thread-safe.
+void hammer_disk_and_net(IOReactor* reactor, drive_handle const& drive, int iterations, uint64_t offset_base,
+                         int original_poll_interval) {
+    for (int iter = 0; iter < iterations; ++iter) {
+        auto const [fd0, fd1] = make_connected_pair();
+        socket_handle sock(fd0, thread_specifier{reactor});
+        std::array< uint8_t, 5 > read_buf{};
+        std::array< char, 4096 > write_buf{};
+
+        std::promise< io_result > drive_promise;
+        std::promise< io_result > net_promise;
+        auto drive_fut = drive_promise.get_future();
+        auto net_fut = net_promise.get_future();
+
+        iomanager.run_on_wait(reactor, [&]() {
+            detach(async_write(drive, write_buf.data(), write_buf.size(),
+                               offset_base + static_cast< uint64_t >(iter) * write_buf.size()),
+                   [&drive_promise](io_result r) { drive_promise.set_value(std::move(r)); });
+            detach(async_recv(sock, std::span< uint8_t >(read_buf)),
+                   [&net_promise](io_result r) { net_promise.set_value(std::move(r)); });
+        });
+
+        std::array< uint8_t, 5 > const payload{'h', 'e', 'l', 'l', 'o'};
+        if (iter % 2 == 0) {
+            // Nudge net to resolve first: write to unblock it, then wait on it, before waiting on drive.
+            ASSERT_EQ(::write(fd1, payload.data(), payload.size()), static_cast< ssize_t >(payload.size()))
+                << "iter " << iter;
+            ASSERT_TRUE(net_fut.get().has_value()) << "iter " << iter;
+            ASSERT_TRUE(drive_fut.get().has_value()) << "iter " << iter;
+        } else {
+            // Nudge drive to resolve first: wait on it before even writing to unblock net.
+            ASSERT_TRUE(drive_fut.get().has_value()) << "iter " << iter;
+            ASSERT_EQ(::write(fd1, payload.data(), payload.size()), static_cast< ssize_t >(payload.size()))
+                << "iter " << iter;
+            ASSERT_TRUE(net_fut.get().has_value()) << "iter " << iter;
+        }
+
+        int current_poll_interval{};
+        iomanager.run_on_wait(reactor, [&]() { current_poll_interval = reactor->get_poll_interval(); });
+        ASSERT_EQ(current_poll_interval, original_poll_interval) << "iter " << iter;
+
+        ::close(fd1);
+    }
 }
 
 } // namespace
@@ -825,6 +879,71 @@ TEST_F(NetOpTest, ConcurrentDiskAndNetIODontCorruptReactorPollInterval) {
     std::filesystem::remove(dev_path);
 }
 
+// The fix for the bug above is a plain ref count (IOReactor::enter_tight_poll/exit_tight_poll), which
+// should be correct for ANY completion ordering or interleaving by construction, not just the one
+// ordering (drive resolves, then net) that originally exposed the bug. This hammers both orderings across
+// many iterations on one reactor to actually put that claim to the test.
+TEST_F(NetOpTest, HammeredConcurrentDiskAndNetIOKeepsPollIntervalCorrect) {
+    std::string const dev_path = "/tmp/iomgr_net_op_test_drive_hammer_" + std::to_string(::getpid());
+    {
+        int const fd = ::open(dev_path.c_str(), O_RDWR | O_CREAT, 0666);
+        ASSERT_GE(fd, 0);
+        ::close(fd);
+    }
+    std::filesystem::resize_file(dev_path, 8 * 1024 * 1024);
+    auto drive_result = open_drive(dev_path, O_CREAT | O_RDWR);
+    ASSERT_TRUE(drive_result.has_value());
+    auto drive = std::move(drive_result.value());
+
+    auto* const reactor = pick_a_worker_reactor();
+    int original_poll_interval{};
+    iomanager.run_on_wait(reactor, [&]() { original_poll_interval = reactor->get_poll_interval(); });
+
+    hammer_disk_and_net(reactor, drive, 100, 0, original_poll_interval);
+
+    drive.reset();
+    std::filesystem::remove(dev_path);
+}
+
+// Same hammering, but on two reactors genuinely in parallel (each a real OS thread already; dispatching
+// to both via run_on_wait from two separate host threads here just means neither call blocks the other,
+// so both reactors' hammering loops actually overlap in wall-clock time) -- separate drive files per
+// reactor to keep the two loops' disk I/O fully independent, not just the sockets.
+TEST_F(NetOpTest, HammeredConcurrentDiskAndNetIOAcrossMultipleReactorsInParallel) {
+    auto reactors = two_distinct_worker_reactors();
+    ASSERT_GE(reactors.size(), 2u);
+
+    std::string const dev_path_a = "/tmp/iomgr_net_op_test_drive_hammer_a_" + std::to_string(::getpid());
+    std::string const dev_path_b = "/tmp/iomgr_net_op_test_drive_hammer_b_" + std::to_string(::getpid());
+    for (auto const& path : {dev_path_a, dev_path_b}) {
+        int const fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0666);
+        ASSERT_GE(fd, 0);
+        ::close(fd);
+        std::filesystem::resize_file(path, 8 * 1024 * 1024);
+    }
+    auto drive_a_result = open_drive(dev_path_a, O_CREAT | O_RDWR);
+    auto drive_b_result = open_drive(dev_path_b, O_CREAT | O_RDWR);
+    ASSERT_TRUE(drive_a_result.has_value());
+    ASSERT_TRUE(drive_b_result.has_value());
+    auto drive_a = std::move(drive_a_result.value());
+    auto drive_b = std::move(drive_b_result.value());
+
+    int poll_interval_a{};
+    int poll_interval_b{};
+    iomanager.run_on_wait(reactors[0], [&]() { poll_interval_a = reactors[0]->get_poll_interval(); });
+    iomanager.run_on_wait(reactors[1], [&]() { poll_interval_b = reactors[1]->get_poll_interval(); });
+
+    std::thread t1([&]() { hammer_disk_and_net(reactors[0], drive_a, 50, 0, poll_interval_a); });
+    std::thread t2([&]() { hammer_disk_and_net(reactors[1], drive_b, 50, 0, poll_interval_b); });
+    t1.join();
+    t2.join();
+
+    drive_a.reset();
+    drive_b.reset();
+    std::filesystem::remove(dev_path_a);
+    std::filesystem::remove(dev_path_b);
+}
+
 // "Multi-threaded hammering" doesn't mean racing multiple OS threads against one socket_handle -- that's
 // not a supported usage pattern (every op must run on the handle's owning reactor; see
 // NetOpDeathTest.SecondConcurrentRecvOnSameSocketAborts below for what happens if you try). What's
@@ -963,6 +1082,67 @@ TEST(NetOpReactorStopTest, CancelsOutstandingAcceptAndConnectInstead) {
 
     ::close(client_fd);
     ::unlink(path.c_str());
+}
+
+// The scenario behind this whole file's "does the combined case work" question, but for shutdown
+// specifically: a disk write and a net recv both genuinely outstanding on the same reactor, and the
+// reactor stops out from under both at once. IOReactor::stop() runs each attached interface's
+// on_reactor_stop in registration order (general, then net, then drive -- see iomgr.cpp), so
+// UringNetInterface::drain_outstanding_ops() and UringDriveInterface::drain_outstanding_ios() run
+// sequentially, each against its own ring with its own independent 5s deadline (not a shared budget --
+// worth knowing operationally, even though it isn't a correctness bug). What this actually checks: that
+// doesn't hang, and both resolve. The net recv is guaranteed to resolve via cancellation (nothing ever
+// writes to unblock it); the disk write may resolve via normal completion or cancellation depending on
+// exactly how far it got before stop() ran -- either is an acceptable outcome, only hanging isn't.
+TEST(NetOpReactorStopTest, CancelsOutstandingDiskAndNetIOInstead) {
+    ioenvironment.with_iomgr(iomgr_params{.num_threads = 1});
+    std::string const dev_path = "/tmp/iomgr_net_op_test_drive_stop_" + std::to_string(::getpid());
+    {
+        int const fd = ::open(dev_path.c_str(), O_RDWR | O_CREAT, 0666);
+        ASSERT_GE(fd, 0);
+        ::close(fd);
+    }
+    std::filesystem::resize_file(dev_path, 1024 * 1024);
+    auto drive_result = open_drive(dev_path, O_CREAT | O_RDWR);
+    ASSERT_TRUE(drive_result.has_value());
+    auto drive = std::move(drive_result.value());
+
+    IOReactor* reactor{nullptr};
+    iomanager.run_on_wait(reactor_regex::random_worker, [&reactor]() { reactor = iomanager.this_reactor(); });
+
+    auto const [fd0, fd1] = make_connected_pair();
+    // Heap-allocated and deliberately leaked, same reasoning as the other NetOpReactorStopTest cases:
+    // its destructor would try to dispatch onto `reactor`, which is about to stop.
+    auto* const sock = new socket_handle(fd0, thread_specifier{reactor});
+    std::array< uint8_t, 5 > read_buf{};
+    std::array< char, 4096 > write_buf{};
+
+    io_result drive_result_out{0};
+    io_result net_result_out{0};
+    bool drive_completed{false};
+    bool net_completed{false};
+
+    iomanager.run_on_wait(reactor, [&]() {
+        detach(async_write(drive, write_buf.data(), write_buf.size(), 0), [&](io_result r) {
+            drive_result_out = std::move(r);
+            drive_completed = true;
+        });
+        detach(async_recv(*sock, std::span< uint8_t >(read_buf)), [&](io_result r) {
+            net_result_out = std::move(r);
+            net_completed = true;
+        });
+    });
+
+    // No wait: stop immediately, to maximize the chance both are still genuinely in flight.
+    iomanager.stop(); // must cancel/drain both, not hang
+
+    EXPECT_TRUE(drive_completed);
+    EXPECT_TRUE(net_completed);
+    EXPECT_FALSE(net_result_out.has_value()); // nothing ever wrote to fd1 to unblock it
+
+    ::close(fd1);
+    drive.reset();
+    std::filesystem::remove(dev_path);
 }
 
 namespace {
