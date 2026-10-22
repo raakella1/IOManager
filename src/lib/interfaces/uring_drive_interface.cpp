@@ -137,15 +137,16 @@ void UringDriveInterface::drain_outstanding_ios() {
 namespace {
 inline void io_started() {
     auto* const ch = UringDriveInterface::this_channel();
-    if (ch->m_outstanding++ == 0) {
-        // tight-poll so queued SQEs flush promptly; restore the reactor's prior interval when drained.
-        ch->m_saved_poll_interval = iomanager.this_reactor()->get_poll_interval();
-        iomanager.this_reactor()->set_poll_interval(0);
-    }
+    // tight-poll so queued SQEs flush promptly; restore the reactor's prior interval when drained.
+    // Routed through the reactor's own ref-counted enter/exit_tight_poll (shared with net_op's identical
+    // need) rather than saving/restoring the interval locally here: two independent save/restore pairs
+    // touching the same IOReactor::m_poll_interval can stomp each other if drive's and net's outstanding
+    // windows overlap -- see enter_tight_poll's own comment for the exact failure mode.
+    if (ch->m_outstanding++ == 0) { iomanager.this_reactor()->enter_tight_poll(); }
 }
 inline void io_finished() {
     auto* const ch = UringDriveInterface::this_channel();
-    if (--ch->m_outstanding == 0) { iomanager.this_reactor()->set_poll_interval(ch->m_saved_poll_interval); }
+    if (--ch->m_outstanding == 0) { iomanager.this_reactor()->exit_tight_poll(); }
 }
 // Advance an iovec list past `done` consumed bytes (drops fully-consumed entries, trims the first
 // partially-consumed one). Used for partial readv/writev re-issue.

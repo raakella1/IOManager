@@ -19,6 +19,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <mutex>
 #include <optional>
@@ -39,9 +40,11 @@ extern "C" {
 #include <sisl/options/options.h>
 #include <gtest/gtest.h>
 
+#include <iomgr/drive.hpp>
 #include <iomgr/io_environment.hpp>
 #include <iomgr/iomgr.hpp>
 #include <iomgr/net_op.hpp>
+#include "reactor/reactor.hpp" // internal: whitebox check of IOReactor::get_poll_interval() below
 
 using namespace iomgr;
 
@@ -744,6 +747,82 @@ TEST_F(NetOpTest, ConcurrentActivityAcrossMultipleReactorsDoesntCrossTalk) {
     for (auto& c : conns) {
         ::close(c.peer_fd);
     }
+}
+
+// Both UringDriveInterface and UringNetInterface are attached to every all_io reactor (see iomgr.cpp), so
+// any reactor doing both disk and socket I/O runs two independent per-reactor rings side by side -- this
+// is the combination every other test in this file exercises implicitly (both interfaces are always
+// attached) but never ACTIVELY: no other test has disk I/O and net I/O genuinely outstanding on the same
+// reactor at the same time.
+//
+// That matters because of how each side's tight-poll optimization works: io_started()/io_finished()
+// (drive) and net_io_started()/net_io_finished() (net) each independently save the reactor's current
+// poll_interval on their own outstanding-count's 0->1 transition and restore it on the ->0 transition --
+// but both read/write the SAME IOReactor::m_poll_interval, via two uncoordinated save/restore pairs. If
+// drive's op goes outstanding first (saving the true original interval, then zeroing it) and net's op
+// goes outstanding second (saving what it sees, which is already-zeroed), net's eventual restore
+// overwrites the reactor's poll_interval with 0 instead of the true original -- permanently, even once
+// both are idle again. That's not a performance nit: poll_interval stuck at 0 is an idle reactor thread
+// spinning its epoll_wait in a tight loop forever, a real CPU-pegging production bug, not caught by
+// testing drive or net in isolation since each one's own counter correctly returns to 0 on its own.
+TEST_F(NetOpTest, ConcurrentDiskAndNetIODontCorruptReactorPollInterval) {
+    std::string const dev_path = "/tmp/iomgr_net_op_test_drive_" + std::to_string(::getpid());
+    {
+        int const fd = ::open(dev_path.c_str(), O_RDWR | O_CREAT, 0666);
+        ASSERT_GE(fd, 0);
+        ::close(fd);
+    }
+    std::filesystem::resize_file(dev_path, 1024 * 1024);
+    auto drive_result = open_drive(dev_path, O_CREAT | O_RDWR);
+    ASSERT_TRUE(drive_result.has_value());
+    auto drive = std::move(drive_result.value());
+
+    auto* const reactor = pick_a_worker_reactor();
+    int original_poll_interval{};
+    iomanager.run_on_wait(reactor, [&]() { original_poll_interval = reactor->get_poll_interval(); });
+
+    auto const [fd0, fd1] = make_connected_pair();
+    socket_handle sock(fd0, thread_specifier{reactor});
+    std::array< uint8_t, 5 > read_buf{};
+    std::array< char, 4096 > write_buf{};
+
+    std::promise< io_result > drive_promise;
+    std::promise< io_result > net_promise;
+    auto drive_fut = drive_promise.get_future();
+    auto net_fut = net_promise.get_future();
+
+    iomanager.run_on_wait(reactor, [&]() {
+        // Disk write goes outstanding first (io_started's 0->1 transition fires synchronously as part of
+        // this call, before returning here -- UringDriveInterface::async_write has no raw-syscall fast
+        // path the way net_op's recv/send do, so this is guaranteed, not just likely).
+        detach(async_write(drive, write_buf.data(), write_buf.size(), 0),
+               [&drive_promise](io_result r) { drive_promise.set_value(std::move(r)); });
+        // Net recv goes outstanding second, while the write above is still in flight -- exactly the
+        // interleaving the bug needs.
+        detach(async_recv(sock, std::span< uint8_t >(read_buf)),
+               [&net_promise](io_result r) { net_promise.set_value(std::move(r)); });
+    });
+
+    // Let the disk write resolve first (it always suspends at least one tick; see above), then the net
+    // recv second, so net's own outstanding count is the one that transitions back to zero last --
+    // whichever side does that last is the one whose (possibly-corrupted) saved interval "wins".
+    auto const drive_r = drive_fut.get();
+    ASSERT_TRUE(drive_r.has_value());
+
+    std::array< uint8_t, 5 > const payload{'h', 'e', 'l', 'l', 'o'};
+    ASSERT_EQ(::write(fd1, payload.data(), payload.size()), static_cast< ssize_t >(payload.size()));
+    auto const net_r = net_fut.get();
+    ASSERT_TRUE(net_r.has_value());
+
+    int final_poll_interval{};
+    iomanager.run_on_wait(reactor, [&]() { final_poll_interval = reactor->get_poll_interval(); });
+    EXPECT_EQ(final_poll_interval, original_poll_interval)
+        << "reactor poll_interval was left at " << final_poll_interval << " instead of restored to "
+        << original_poll_interval << " -- an idle reactor stuck tight-polling forever";
+
+    ::close(fd1);
+    drive.reset();
+    std::filesystem::remove(dev_path);
 }
 
 // "Multi-threaded hammering" doesn't mean racing multiple OS threads against one socket_handle -- that's

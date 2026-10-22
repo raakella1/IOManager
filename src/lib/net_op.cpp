@@ -116,18 +116,18 @@ std::error_condition exception_to_error_condition(std::exception const& e) {
 
 // Outstanding accounting + tight-poll while a net op is in flight, mirroring UringDriveInterface's
 // io_started()/io_finished(): lets UringNetInterface's reactor-stop drain know when it's safe to tear the
-// ring down, and keeps completions flushing promptly while anything is outstanding.
+// ring down, and keeps completions flushing promptly while anything is outstanding. Routed through the
+// reactor's own ref-counted enter/exit_tight_poll (shared with drive's identical need) rather than saving
+// the interval locally here -- see IOReactor::enter_tight_poll's comment for why a reactor doing both
+// disk and net I/O needs this to be shared, not two independent save/restore pairs.
 void net_io_started() {
     auto* const ch = UringNetInterface::this_channel();
-    if (ch->m_outstanding++ == 0) {
-        ch->m_saved_poll_interval = iomanager.this_reactor()->get_poll_interval();
-        iomanager.this_reactor()->set_poll_interval(0);
-    }
+    if (ch->m_outstanding++ == 0) { iomanager.this_reactor()->enter_tight_poll(); }
 }
 
 void net_io_finished() {
     auto* const ch = UringNetInterface::this_channel();
-    if (--ch->m_outstanding == 0) { iomanager.this_reactor()->set_poll_interval(ch->m_saved_poll_interval); }
+    if (--ch->m_outstanding == 0) { iomanager.this_reactor()->exit_tight_poll(); }
 }
 
 // Constructed first (incremented first) / destroyed last (decremented last) relative to each coroutine's

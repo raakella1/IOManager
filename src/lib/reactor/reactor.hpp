@@ -165,6 +165,25 @@ public:
 
     void set_poll_interval(const int interval) { m_poll_interval = interval; }
     int get_poll_interval() const { return m_poll_interval; }
+
+    // Ref-counted "run this reactor's loop in a tight (0ms) poll while outstanding async IO drains"
+    // request, shared by every uring-backed interface on this reactor (drive, net, ...). Each interface
+    // used to save/restore m_poll_interval on its own private outstanding-count's 0<->1 edges; with two
+    // (or more) independent save/restore pairs touching the same m_poll_interval, whichever one's count
+    // drops to zero last "wins" and can stomp the true original interval with whatever the SECOND one
+    // happened to observe when it started (0, if the first was already mid-tight-poll) -- leaving the
+    // reactor permanently spinning at 0ms even once fully idle. Centralizing the ref count here is what
+    // makes "first one in enables it, last one out restores the true original" correct regardless of how
+    // many interfaces are sharing it or how their outstanding windows overlap.
+    void enter_tight_poll() {
+        if (m_tight_poll_refcount++ == 0) {
+            m_poll_interval_before_tight = m_poll_interval;
+            m_poll_interval = 0;
+        }
+    }
+    void exit_tight_poll() {
+        if (--m_tight_poll_refcount == 0) { m_poll_interval = m_poll_interval_before_tight; }
+    }
     poll_cb_idx_t register_poll_interval_cb(std::function< void(void) >&& cb);
     void unregister_poll_interval_cb(const poll_cb_idx_t idx);
     IOThreadMetrics& thread_metrics() { return *(m_metrics.get()); }
@@ -211,6 +230,8 @@ protected:
     uint32_t m_n_iodevices = 0;
 
     int m_poll_interval{-1};
+    uint32_t m_tight_poll_refcount{0};
+    int m_poll_interval_before_tight{-1};
     uint64_t m_total_op = 0;
 
     std::vector< std::function< void(void) > > m_poll_interval_cbs;

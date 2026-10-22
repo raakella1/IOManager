@@ -44,8 +44,7 @@ struct uring_net_channel {
     sisl::async::io_uring_scheduler m_sched; // wraps &m_ring; non-movable
     io_device_ptr m_ring_ev_iodev;
     uint32_t m_sentinel_idx{0};
-    uint64_t m_outstanding{0};     // in-flight net ops on this reactor
-    int m_saved_poll_interval{-1}; // reactor poll interval captured while tight-polling outstanding IO
+    uint64_t m_outstanding{0}; // in-flight net ops on this reactor
     // connect_op has no owning handle of its own (unlike socket_handle/listener_handle) to host a scope
     // that outlives any single call, so its run_uring_connect task spawns into this channel-level one
     // instead -- long-lived for the reactor's whole life, so resuming a connect's waiter (which may
