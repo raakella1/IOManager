@@ -12,9 +12,10 @@
  * specific language governing permissions and limitations under the License.
  **************************************************************************/
 
-// Implementation of the public socket_handle/net_op API (iomgr/net_op.hpp) over a dedicated per-reactor
-// io_uring channel (interfaces/uring_net_interface.hpp). This is the ONLY place the public handle/awaiter
-// meet io_uring/liburing details; nothing leaks into the public header.
+// Implementation of the public socket/listener/connect API (iomgr/net_op.hpp, accept_op.hpp,
+// connect_op.hpp) over a dedicated per-reactor io_uring channel (interfaces/uring_net_interface.hpp).
+// This is the ONLY place the public handles/awaiters meet io_uring/liburing details; nothing leaks into
+// the public headers.
 
 #include <cerrno>
 #include <chrono>
@@ -30,6 +31,8 @@ extern "C" {
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
 #include <sisl/logging/logging.h>
+#include <iomgr/accept_op.hpp>
+#include <iomgr/connect_op.hpp>
 #include <iomgr/iomgr.hpp>
 #include <iomgr/net_op.hpp>
 #include "interfaces/uring_net_interface.hpp"

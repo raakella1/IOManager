@@ -41,6 +41,8 @@ extern "C" {
 #include <sisl/options/options.h>
 #include <gtest/gtest.h>
 
+#include <iomgr/accept_op.hpp>
+#include <iomgr/connect_op.hpp>
 #include <iomgr/drive.hpp>
 #include <iomgr/io_environment.hpp>
 #include <iomgr/iomgr.hpp>
