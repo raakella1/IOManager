@@ -31,8 +31,8 @@ thread_local uring_net_channel* UringNetInterface::t_uring_net_ch{nullptr};
 uring_net_channel::uring_net_channel(UringNetInterface* iface) : m_sched{&m_ring} {
     // iomgr_params::net_uring_qdepth (0 = unset) takes precedence over the process-wide dynamic config
     // default.
-    auto const qdepth =
-        (iomanager.m_net_uring_qdepth != 0) ? iomanager.m_net_uring_qdepth : IM_DYNAMIC_CONFIG(net.uring_per_thread_qdepth);
+    auto const qdepth = (iomanager.m_net_uring_qdepth != 0) ? iomanager.m_net_uring_qdepth
+                                                            : IM_DYNAMIC_CONFIG(net.uring_per_thread_qdepth);
 
     // See uring_drive_channel's constructor for the rationale on these flags -- same per-reactor,
     // single-submitter story applies here.
@@ -49,8 +49,7 @@ uring_net_channel::uring_net_channel(UringNetInterface* iface) : m_sched{&m_ring
 
     int ret = io_uring_queue_init_params(qdepth, &m_ring, &params);
     if ((ret == -EINVAL) && (params.flags != 0)) {
-        LOGWARN("io_uring setup flags {:#x} unsupported by this kernel; retrying net ring with defaults",
-                params.flags);
+        LOGWARN("io_uring setup flags {:#x} unsupported by this kernel; retrying net ring with defaults", params.flags);
         params = io_uring_params{};
         ret = io_uring_queue_init_params(qdepth, &m_ring, &params);
     }

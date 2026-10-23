@@ -611,12 +611,12 @@ TEST_F(NetOpTest, ConnectSucceedsAndRoundTrips) {
     // connect() can complete as soon as the kernel enqueues the pending connection into the listener's
     // backlog -- it doesn't need to race an in-flight accept, so issuing them sequentially is deterministic.
     iomanager.run_on_wait(reactor, [&]() {
-        [](listener_handle& l, int cfd, sockaddr_un a, IOReactor* r,
-           std::expected< void, std::error_condition >& cres, accept_result& ares) -> sisl::async::light_task< void > {
+        [](listener_handle& l, int cfd, sockaddr_un a, IOReactor* r, std::expected< void, std::error_condition >& cres,
+           accept_result& ares) -> sisl::async::light_task< void > {
             cres = co_await async_connect(cfd, reinterpret_cast< sockaddr* >(&a), sizeof(a), thread_specifier{r});
             ares = co_await async_accept(l);
         }(listener, client_fd, addr, reactor, connect_result, accept_res)
-                                                                      .detach();
+                                       .detach();
     });
 
     ASSERT_TRUE(connect_result.has_value());
@@ -628,16 +628,15 @@ TEST_F(NetOpTest, ConnectSucceedsAndRoundTrips) {
     std::array< uint8_t, 4 > const payload{'p', 'i', 'n', 'g'};
     io_result rt_result{0};
     iomanager.run_on_wait(reactor, [&]() {
-        rt_result =
-            sisl::async::sync_get([](socket_handle& snd, socket_handle& rcv,
-                                     std::span< uint8_t const > out) -> sisl::async::light_task< io_result > {
-                auto sr = co_await send_all(snd, out);
-                if (!sr) { co_return sr; }
-                std::array< uint8_t, 4 > in{};
-                auto rr = co_await recv_exact(rcv, std::span< uint8_t >(in));
-                if (!rr) { co_return rr; }
-                co_return io_result{std::equal(in.begin(), in.end(), out.begin()) ? *rr : 0};
-            }(client, server, std::span< uint8_t const >(payload)));
+        rt_result = sisl::async::sync_get([](socket_handle& snd, socket_handle& rcv,
+                                             std::span< uint8_t const > out) -> sisl::async::light_task< io_result > {
+            auto sr = co_await send_all(snd, out);
+            if (!sr) { co_return sr; }
+            std::array< uint8_t, 4 > in{};
+            auto rr = co_await recv_exact(rcv, std::span< uint8_t >(in));
+            if (!rr) { co_return rr; }
+            co_return io_result{std::equal(in.begin(), in.end(), out.begin()) ? *rr : 0};
+        }(client, server, std::span< uint8_t const >(payload)));
     });
 
     ASSERT_TRUE(rt_result.has_value());
@@ -760,8 +759,8 @@ TEST_F(NetOpTest, ConcurrentActivityAcrossMultipleReactorsDoesntCrossTalk) {
     for (size_t r = 0; r < reactors.size(); ++r) {
         for (int i = 0; i < kPerReactor; ++i) {
             auto& c = conns[r * kPerReactor + static_cast< size_t >(i)];
-            futs.push_back(
-                start< io_result >(reactors[r], [&c]() { return recv_exact(*c.sock, std::span< uint8_t >(c.read_buf)); }));
+            futs.push_back(start< io_result >(
+                reactors[r], [&c]() { return recv_exact(*c.sock, std::span< uint8_t >(c.read_buf)); }));
         }
     }
     for (auto& c : conns) {
@@ -916,7 +915,7 @@ TEST_F(NetOpTest, RepeatedTeardownDuringFlightDoesNotRaceOrLeak) {
                     out = co_await async_recv(s, buf);
                     done = true;
                 }(*sock, std::span< uint8_t >(read_buf), result, completed)
-                                                                                  .detach();
+                                      .detach();
             });
             ASSERT_FALSE(completed) << "iter " << iter;
             sock.reset(); // destroyed from this thread, still parked
@@ -1008,7 +1007,7 @@ TEST(NetOpReactorStopTest, CancelsOutstandingAcceptAndConnectInstead) {
             out = co_await async_connect(fd, reinterpret_cast< sockaddr* >(&a), sizeof(a), thread_specifier{r});
             done = true;
         }(client_fd, addr, reactor, connect_res, connect_completed)
-                                                                      .detach();
+                              .detach();
     });
     ASSERT_FALSE(connect_completed);
 
@@ -1089,11 +1088,11 @@ void trigger_second_concurrent_recv() {
         [](socket_handle& s, std::span< uint8_t > b) -> sisl::async::light_task< void > {
             co_await async_recv(s, b);
         }(sock, std::span< uint8_t >(buf1))
-                                                .detach();
+                                                            .detach();
         [](socket_handle& s, std::span< uint8_t > b) -> sisl::async::light_task< void > {
             co_await async_recv(s, b);
         }(sock, std::span< uint8_t >(buf2))
-                                                .detach();
+                                                            .detach();
     });
     ::close(fd1);
 }

@@ -155,9 +155,7 @@ struct net_op::impl {
     bool done{false};
     std::coroutine_handle<> waiter{};
 
-    io_result try_once() const {
-        return is_send ? try_send(owner->fd, send_buf) : try_recv(owner->fd, recv_buf);
-    }
+    io_result try_once() const { return is_send ? try_send(owner->fd, send_buf) : try_recv(owner->fd, recv_buf); }
 
     ~impl() {
         RELEASE_ASSERT(owner->parked_recv != this && owner->parked_send != this,
@@ -230,7 +228,8 @@ exec::task< void > run_uring_op(net_op::impl* self) {
             if (completed) { return; }
             net_op::impl*& slot = self->is_send ? self->owner->parked_send : self->owner->parked_recv;
             if (slot == self) {
-                complete_parked(slot, io_result{std::unexpected(std::make_error_condition(std::errc::connection_aborted))});
+                complete_parked(slot,
+                                io_result{std::unexpected(std::make_error_condition(std::errc::connection_aborted))});
             }
         }
     } guard{self};
@@ -292,8 +291,8 @@ exec::task< void > run_uring_accept(accept_op::impl* self) {
             if (completed) { return; }
             accept_op::impl*& slot = self->owner->parked_accept;
             if (slot == self) {
-                complete_parked(slot,
-                                accept_result{std::unexpected(std::make_error_condition(std::errc::connection_aborted))});
+                complete_parked(
+                    slot, accept_result{std::unexpected(std::make_error_condition(std::errc::connection_aborted))});
             }
         }
     } guard{self};
@@ -318,8 +317,9 @@ exec::task< void > run_uring_accept(accept_op::impl* self) {
     accept_op::impl*& slot = self->owner->parked_accept;
     if (slot == self) {
         if (res < 0) {
-            complete_parked(slot, accept_result{std::unexpected(
-                                      std::error_code{-res, std::system_category()}.default_error_condition())});
+            complete_parked(slot,
+                            accept_result{std::unexpected(
+                                std::error_code{-res, std::system_category()}.default_error_condition())});
         } else {
             complete_parked(slot, accept_result{res});
         }

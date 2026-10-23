@@ -217,8 +217,8 @@ sentinel_cb_idx_t IOReactor::attach_iomgr_sentinel_cb(const listen_sentinel_cb_t
 
 void IOReactor::detach_iomgr_sentinel_cb(const sentinel_cb_idx_t idx) {
     DEBUG_ASSERT(idx < m_iomgr_sentinel_cbs.size(), "Invalid sentinel cb idx {} to unregister", idx);
-    DEBUG_ASSERT(m_iomgr_sentinel_cbs[idx] != nullptr,
-                 "Sentinel cb idx {} already unregistered or never registered", idx);
+    DEBUG_ASSERT(m_iomgr_sentinel_cbs[idx] != nullptr, "Sentinel cb idx {} already unregistered or never registered",
+                 idx);
     m_iomgr_sentinel_cbs[idx] = nullptr;
 }
 
