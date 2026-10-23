@@ -166,15 +166,12 @@ public:
     void set_poll_interval(const int interval) { m_poll_interval = interval; }
     int get_poll_interval() const { return m_poll_interval; }
 
-    // Ref-counted "run this reactor's loop in a tight (0ms) poll while outstanding async IO drains"
-    // request, shared by every uring-backed interface on this reactor (drive, net, ...). Each interface
-    // used to save/restore m_poll_interval on its own private outstanding-count's 0<->1 edges; with two
-    // (or more) independent save/restore pairs touching the same m_poll_interval, whichever one's count
-    // drops to zero last "wins" and can stomp the true original interval with whatever the SECOND one
-    // happened to observe when it started (0, if the first was already mid-tight-poll) -- leaving the
-    // reactor permanently spinning at 0ms even once fully idle. Centralizing the ref count here is what
-    // makes "first one in enables it, last one out restores the true original" correct regardless of how
-    // many interfaces are sharing it or how their outstanding windows overlap.
+    // Ref-counted "run this reactor in a tight (0ms) poll while uring-backed I/O is outstanding" request,
+    // shared by every uring interface on this reactor (drive, net, ...). Two independent save/restore
+    // pairs against the same m_poll_interval can corrupt it: whichever drops to zero last may restore the
+    // value it observed on entry, which can itself already be the tight-poll 0, leaving the reactor
+    // spinning forever. A single shared refcount fixes this: first caller in saves, last caller out
+    // restores, regardless of how many interfaces share it or how they interleave.
     void enter_tight_poll() {
         if (m_tight_poll_refcount++ == 0) {
             m_poll_interval_before_tight = m_poll_interval;

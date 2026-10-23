@@ -45,12 +45,9 @@ struct uring_net_channel {
     io_device_ptr m_ring_ev_iodev;
     uint32_t m_sentinel_idx{0};
     uint64_t m_outstanding{0}; // in-flight net ops on this reactor
-    // connect_op has no owning handle of its own (unlike socket_handle/listener_handle) to host a scope
-    // that outlives any single call, so its run_uring_connect task spawns into this channel-level one
-    // instead -- long-lived for the reactor's whole life, so resuming a connect's waiter (which may
-    // immediately destroy the connect_op) can never race the scope's own self-destruction the way a
-    // per-call scope owned by connect_op::impl itself would (confirmed by hitting exec::async_scope's
-    // "__active_ == 0" destructor assertion with that approach).
+    // connect_op has no persistent owner to host its own per-call scope, so run_uring_connect spawns into
+    // this long-lived, channel-level scope instead -- avoids racing a connect's resume (which may
+    // immediately destroy the connect_op) against the scope's own destruction.
     exec::async_scope m_scope;
 
     uring_net_channel(UringNetInterface* iface);
@@ -73,10 +70,9 @@ public:
 private:
     void init_iface_reactor_context(IOReactor*) override;
     void clear_iface_reactor_context(IOReactor*) override;
-    // Reactor stop: actively cancel everything still in flight on this channel's ring (unlike disk I/O, a
-    // parked accept/recv/connect can wait forever for an external event that will never come once this
-    // reactor is stopping, so passively waiting for "outstanding == 0" the way drive's drain does is not
-    // safe here), then drive poll_once until every cancellation has landed.
+    // Reactor stop: actively cancels everything still in flight, then polls until cancellation lands.
+    // Unlike drive's passive "wait for outstanding == 0", a parked accept/recv/connect can wait forever
+    // for an external event that will never come once the reactor is stopping.
     void drain_outstanding_ops();
 
 private:

@@ -137,11 +137,8 @@ void UringDriveInterface::drain_outstanding_ios() {
 namespace {
 inline void io_started() {
     auto* const ch = UringDriveInterface::this_channel();
-    // tight-poll so queued SQEs flush promptly; restore the reactor's prior interval when drained.
-    // Routed through the reactor's own ref-counted enter/exit_tight_poll (shared with net_op's identical
-    // need) rather than saving/restoring the interval locally here: two independent save/restore pairs
-    // touching the same IOReactor::m_poll_interval can stomp each other if drive's and net's outstanding
-    // windows overlap -- see enter_tight_poll's own comment for the exact failure mode.
+    // Tight-poll while IO drains; see IOReactor::enter_tight_poll for why this is a shared refcount
+    // rather than a local save/restore here.
     if (ch->m_outstanding++ == 0) { iomanager.this_reactor()->enter_tight_poll(); }
 }
 inline void io_finished() {

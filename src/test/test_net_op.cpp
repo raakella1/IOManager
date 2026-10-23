@@ -116,15 +116,9 @@ std::future< T > start(IOReactor* reactor, Fn&& fn) {
     return fut;
 }
 
-// Repeatedly puts a disk write and a net recv outstanding on `reactor` at the same time, alternating
-// which one is let to resolve first across iterations, and checks the reactor's poll_interval is back to
-// `original_poll_interval` after every single cycle -- not just once, the way
-// ConcurrentDiskAndNetIODontCorruptReactorPollInterval does. The fix (IOReactor::enter_tight_poll/
-// exit_tight_poll) is a plain ref count, which should be correct for any interleaving or ordering by
-// construction -- this is what actually puts that claim to the test across many interleavings instead of
-// trusting it from the one ordering that originally exposed the bug. Safe to call from any thread (used
-// both directly and from worker threads driving multiple reactors in parallel); every local is
-// thread-local to this call, and gtest assertions are thread-safe.
+// Puts a disk write and a net recv outstanding on `reactor` together, alternating which resolves first
+// across iterations, and checks poll_interval is restored after every cycle. Safe to call from any
+// thread; every local here is thread-local to this call.
 void hammer_disk_and_net(IOReactor* reactor, drive_handle const& drive, int iterations, uint64_t offset_base,
                          int original_poll_interval) {
     for (int iter = 0; iter < iterations; ++iter) {
@@ -177,14 +171,10 @@ public:
     void TearDown() override { iomanager.stop(); }
 };
 
-// Confirms iomgr_params::net_uring_qdepth is actually wired through to the net channel's ring (not just
-// that the field exists), and that an explicit, intentionally-small-but-reasonable override doesn't break
-// ordinary operation. This does NOT attempt to exercise genuine ring exhaustion (an unflushable "still
-// full after acquire_sqe's own flush-and-retry" condition): acquire_sqe's retry runs per-op, sequentially,
-// so an ordinary burst of fast local socket I/O self-heals via that retry before ever reaching the
-// exhaustion path -- forcing the real thing would need the completion side backed up too, not just a
-// small SQ depth. That fix (net_op.cpp's try/catch around each uring submission) remains verified by
-// reading the code, not by a passing test here.
+// Confirms iomgr_params::net_uring_qdepth is wired through to the net channel's ring and that a small
+// override doesn't break ordinary operation. Does not exercise genuine ring exhaustion -- an ordinary
+// burst self-heals via acquire_sqe's own flush-and-retry; see net_op.cpp's exception_to_error_condition
+// for the exhaustion path itself, which is verified by reading the code.
 TEST(NetOpCustomQdepthTest, ExplicitOverrideStillWorks) {
     ioenvironment.with_iomgr(iomgr_params{.num_threads = 2, .net_uring_qdepth = 8});
     auto const [fd0, fd1] = make_connected_pair();
@@ -212,14 +202,9 @@ TEST(NetOpCustomQdepthTest, ExplicitOverrideStillWorks) {
     iomanager.stop();
 }
 
-// A deliberately adversarial stress case for the queue-depth knob itself: 100 sockets concurrently
-// submitting into a ring configured for a depth of only 2. Confirmed empirically (not just by reading
-// io_uring_scheduler's acquire_sqe) that this does NOT reproduce genuine ring exhaustion: acquire_sqe's
-// own flush-and-retry runs per op, sequentially, so each new submission's retry already makes room before
-// the next one is even requested -- an ordinary burst self-heals this way regardless of how small the
-// configured depth is. Kept as a permanent regression check that an extreme depth/concurrency mismatch
-// at least never regresses into a crash or a hang, even though it can't exercise the true-exhaustion
-// error path (that remains verified by code reading only; see net_op.cpp's exception_to_error_condition).
+// Regression check that an extreme depth/concurrency mismatch (100 sockets on a ring sized for 2) never
+// crashes or hangs. Like ExplicitOverrideStillWorks above, this doesn't reach genuine ring exhaustion --
+// acquire_sqe's flush-and-retry self-heals an ordinary burst regardless of configured depth.
 TEST(NetOpRingPressureTest, ManyConcurrentOpsOnATinyRingAllResolve) {
     ioenvironment.with_iomgr(iomgr_params{.num_threads = 1, .net_uring_qdepth = 2});
     auto* const reactor = pick_a_worker_reactor();
@@ -306,12 +291,9 @@ TEST_F(NetOpTest, RecvZeroIsEof) {
     EXPECT_EQ(*result, 0u);
 }
 
-// Complements RecvZeroIsEof: that one covers the read-side EOF signal (a clean 0-byte recv). This covers
-// the write side failing outright once the peer is gone -- MSG_NOSIGNAL turns what would otherwise be a
-// process-killing SIGPIPE into an ordinary error result, same as the raw-syscall fast path.
-// detach() (the fire-and-forget launcher for non-coroutine callers) had no coverage at all until this --
-// every other test drives net_op through a coroutine, via sisl::async::sync_get or a hand-written
-// light_task, never through detach()'s own callback-based path.
+// Complements RecvZeroIsEof: covers the write side failing once the peer is gone (MSG_NOSIGNAL turns what
+// would be a process-killing SIGPIPE into an ordinary error result). Also the only test exercising
+// detach()'s callback-based path rather than a coroutine.
 TEST_F(NetOpTest, DetachInvokesCallbackOnCompletion) {
     auto const [fd0, fd1] = make_connected_pair();
     auto* const reactor = pick_a_worker_reactor();
@@ -680,12 +662,8 @@ TEST_F(NetOpTest, ConnectToNonexistentPathFails) {
 }
 
 TEST_F(NetOpTest, ConnectTimesOut) {
-    // 192.0.2.0/24 is RFC 5737 TEST-NET-1: reserved strictly for documentation/examples, guaranteed never
-    // assigned or routable. A non-blocking connect() to it starts a real TCP handshake (genuine
-    // EINPROGRESS, properly poll-awaitable -- unlike ConnectTimesOut's previous AF_UNIX-backlog approach,
-    // which turned out to report EAGAIN in a way IORING_OP_CONNECT doesn't actually wait on) that will
-    // never get a SYN-ACK or RST, so it sits pending until something gives up -- deterministic without
-    // depending on any peer/listener behavior.
+    // 192.0.2.0/24 is RFC 5737 TEST-NET-1: reserved, never assigned or routable. A connect() to it starts
+    // a real handshake that never gets a SYN-ACK or RST, so it stays pending deterministically.
     auto* const reactor = pick_a_worker_reactor();
     int const client_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_GE(client_fd, 0);
@@ -707,10 +685,8 @@ TEST_F(NetOpTest, ConnectTimesOut) {
     ::close(client_fd);
 }
 
-// All prior tests exercise one or two sockets at a time. This exercises many socket_handles pinned to the
-// SAME reactor recv'ing concurrently, to build confidence the shared per-reactor ring actually
-// disambiguates completions correctly by user_data under real multiplexing rather than just in isolation
-// -- the scenario the whole "hundreds of connections on one reactor" design point is about.
+// Many socket_handles pinned to the same reactor, recv'ing concurrently: checks the shared per-reactor
+// ring disambiguates completions correctly by user_data under real multiplexing.
 TEST_F(NetOpTest, ManyConcurrentRecvsOnOneReactorDontCrossTalk) {
     constexpr int kNumSockets = 32;
     auto* const reactor = pick_a_worker_reactor();
@@ -753,10 +729,8 @@ TEST_F(NetOpTest, ManyConcurrentRecvsOnOneReactorDontCrossTalk) {
     }
 }
 
-// Complements ManyConcurrentRecvsOnOneReactorDontCrossTalk: that one has many connections on ONE ring,
-// proving user_data disambiguation. This has multiple rings on DIFFERENT reactor threads genuinely active
-// at the same time, proving there's no shared state (thread_local channel, sentinel registration, etc.)
-// that only happens to work when there's just one net channel involved.
+// Same as ManyConcurrentRecvsOnOneReactorDontCrossTalk, but across multiple rings on different reactor
+// threads active at the same time, to rule out accidentally-shared state between net channels.
 TEST_F(NetOpTest, ConcurrentActivityAcrossMultipleReactorsDoesntCrossTalk) {
     auto reactors = two_distinct_worker_reactors();
     ASSERT_GE(reactors.size(), 2u);
@@ -803,22 +777,9 @@ TEST_F(NetOpTest, ConcurrentActivityAcrossMultipleReactorsDoesntCrossTalk) {
     }
 }
 
-// Both UringDriveInterface and UringNetInterface are attached to every all_io reactor (see iomgr.cpp), so
-// any reactor doing both disk and socket I/O runs two independent per-reactor rings side by side -- this
-// is the combination every other test in this file exercises implicitly (both interfaces are always
-// attached) but never ACTIVELY: no other test has disk I/O and net I/O genuinely outstanding on the same
-// reactor at the same time.
-//
-// That matters because of how each side's tight-poll optimization works: io_started()/io_finished()
-// (drive) and net_io_started()/net_io_finished() (net) each independently save the reactor's current
-// poll_interval on their own outstanding-count's 0->1 transition and restore it on the ->0 transition --
-// but both read/write the SAME IOReactor::m_poll_interval, via two uncoordinated save/restore pairs. If
-// drive's op goes outstanding first (saving the true original interval, then zeroing it) and net's op
-// goes outstanding second (saving what it sees, which is already-zeroed), net's eventual restore
-// overwrites the reactor's poll_interval with 0 instead of the true original -- permanently, even once
-// both are idle again. That's not a performance nit: poll_interval stuck at 0 is an idle reactor thread
-// spinning its epoll_wait in a tight loop forever, a real CPU-pegging production bug, not caught by
-// testing drive or net in isolation since each one's own counter correctly returns to 0 on its own.
+// Regression test for a reactor running disk and net I/O outstanding at the same time (no other test in
+// this file does); see IOReactor::enter_tight_poll for the poll_interval-corruption bug this guards
+// against.
 TEST_F(NetOpTest, ConcurrentDiskAndNetIODontCorruptReactorPollInterval) {
     std::string const dev_path = "/tmp/iomgr_net_op_test_drive_" + std::to_string(::getpid());
     {
@@ -846,20 +807,15 @@ TEST_F(NetOpTest, ConcurrentDiskAndNetIODontCorruptReactorPollInterval) {
     auto net_fut = net_promise.get_future();
 
     iomanager.run_on_wait(reactor, [&]() {
-        // Disk write goes outstanding first (io_started's 0->1 transition fires synchronously as part of
-        // this call, before returning here -- UringDriveInterface::async_write has no raw-syscall fast
-        // path the way net_op's recv/send do, so this is guaranteed, not just likely).
+        // Drive goes outstanding first (guaranteed to suspend); net goes outstanding second while it's
+        // still in flight -- the interleaving the bug needs.
         detach(async_write(drive, write_buf.data(), write_buf.size(), 0),
                [&drive_promise](io_result r) { drive_promise.set_value(std::move(r)); });
-        // Net recv goes outstanding second, while the write above is still in flight -- exactly the
-        // interleaving the bug needs.
         detach(async_recv(sock, std::span< uint8_t >(read_buf)),
                [&net_promise](io_result r) { net_promise.set_value(std::move(r)); });
     });
 
-    // Let the disk write resolve first (it always suspends at least one tick; see above), then the net
-    // recv second, so net's own outstanding count is the one that transitions back to zero last --
-    // whichever side does that last is the one whose (possibly-corrupted) saved interval "wins".
+    // Drive resolves first, net second, so net is the side that transitions outstanding back to zero last.
     auto const drive_r = drive_fut.get();
     ASSERT_TRUE(drive_r.has_value());
 
@@ -879,10 +835,8 @@ TEST_F(NetOpTest, ConcurrentDiskAndNetIODontCorruptReactorPollInterval) {
     std::filesystem::remove(dev_path);
 }
 
-// The fix for the bug above is a plain ref count (IOReactor::enter_tight_poll/exit_tight_poll), which
-// should be correct for ANY completion ordering or interleaving by construction, not just the one
-// ordering (drive resolves, then net) that originally exposed the bug. This hammers both orderings across
-// many iterations on one reactor to actually put that claim to the test.
+// Hammers both completion orderings across many iterations on one reactor, rather than trusting the
+// single ordering ConcurrentDiskAndNetIODontCorruptReactorPollInterval happens to exercise.
 TEST_F(NetOpTest, HammeredConcurrentDiskAndNetIOKeepsPollIntervalCorrect) {
     std::string const dev_path = "/tmp/iomgr_net_op_test_drive_hammer_" + std::to_string(::getpid());
     {
@@ -905,10 +859,8 @@ TEST_F(NetOpTest, HammeredConcurrentDiskAndNetIOKeepsPollIntervalCorrect) {
     std::filesystem::remove(dev_path);
 }
 
-// Same hammering, but on two reactors genuinely in parallel (each a real OS thread already; dispatching
-// to both via run_on_wait from two separate host threads here just means neither call blocks the other,
-// so both reactors' hammering loops actually overlap in wall-clock time) -- separate drive files per
-// reactor to keep the two loops' disk I/O fully independent, not just the sockets.
+// Same hammering, but on two reactors genuinely in parallel, with separate drive files to keep the two
+// loops' disk I/O fully independent.
 TEST_F(NetOpTest, HammeredConcurrentDiskAndNetIOAcrossMultipleReactorsInParallel) {
     auto reactors = two_distinct_worker_reactors();
     ASSERT_GE(reactors.size(), 2u);
@@ -944,13 +896,8 @@ TEST_F(NetOpTest, HammeredConcurrentDiskAndNetIOAcrossMultipleReactorsInParallel
     std::filesystem::remove(dev_path_b);
 }
 
-// "Multi-threaded hammering" doesn't mean racing multiple OS threads against one socket_handle -- that's
-// not a supported usage pattern (every op must run on the handle's owning reactor; see
-// NetOpDeathTest.SecondConcurrentRecvOnSameSocketAborts below for what happens if you try). What's
-// actually worth hammering is repetition: many cycles of parking-then-tearing-down and
-// parking-then-completing in quick succession, to give the cancel-vs-complete race in
-// run_uring_op/cancel_guard many chances to misbehave rather than just the one shot every other test
-// above gives it.
+// Many cycles of parking-then-tearing-down and parking-then-completing in quick succession, to give the
+// cancel-vs-complete race in run_uring_op/cancel_guard repeated chances to misbehave.
 TEST_F(NetOpTest, RepeatedTeardownDuringFlightDoesNotRaceOrLeak) {
     auto* const reactor = pick_a_worker_reactor();
     constexpr int kIterations = 200;
@@ -990,18 +937,16 @@ TEST_F(NetOpTest, RepeatedTeardownDuringFlightDoesNotRaceOrLeak) {
     }
 }
 
-// Deliberately not a NetOpTest fixture: this exercises what happens when a caller does NOT follow
-// socket_handle's documented contract ("destruction must run before the owning reactor stops"), so it
-// needs to control iomanager's start/stop itself rather than share NetOpTest::TearDown's single stop().
+// Not a NetOpTest fixture: exercises a caller that does NOT follow socket_handle's "destroy before the
+// reactor stops" contract, so it needs its own start/stop rather than NetOpTest::TearDown's.
 TEST(NetOpReactorStopTest, CancelsOutstandingRecvInstead) {
     ioenvironment.with_iomgr(iomgr_params{.num_threads = 2});
     auto const [fd0, fd1] = make_connected_pair();
     IOReactor* reactor{nullptr};
     iomanager.run_on_wait(reactor_regex::random_worker, [&reactor]() { reactor = iomanager.this_reactor(); });
 
-    // Heap-allocated and deliberately leaked: its destructor would try to dispatch onto `reactor`, which
-    // is about to stop -- exactly the hang the documented contract warns about. This test is specifically
-    // about the reactor-stop drain path, not about socket_handle's own (already covered) teardown path.
+    // Heap-allocated and deliberately leaked: destroying it would dispatch onto `reactor`, which is about
+    // to stop.
     auto* const sock = new socket_handle(fd0, thread_specifier{reactor});
 
     io_result result{0};
@@ -1017,10 +962,7 @@ TEST(NetOpReactorStopTest, CancelsOutstandingRecvInstead) {
     });
     ASSERT_FALSE(completed); // parked; nothing written
 
-    // Must not hang despite the still-outstanding recv: the net channel's reactor-stop drain has to
-    // actively cancel it (a peer write that will never come isn't something passive draining can wait
-    // out, unlike disk I/O always eventually completing on its own).
-    iomanager.stop();
+    iomanager.stop(); // must actively cancel the still-outstanding recv, not hang waiting for it
 
     EXPECT_TRUE(completed);
     EXPECT_FALSE(result.has_value());
@@ -1028,18 +970,15 @@ TEST(NetOpReactorStopTest, CancelsOutstandingRecvInstead) {
     ::close(fd0);
 }
 
-// Same drain path as CancelsOutstandingRecvInstead, but for a parked accept and a parked (no-timeout)
-// connect -- drain_outstanding_ops() cancels the whole ring in one shot rather than per-handle, so it
-// needs to actually cover every op kind, not just recv.
+// Same drain path as CancelsOutstandingRecvInstead, for a parked accept and a parked (no-timeout) connect,
+// since drain_outstanding_ops() cancels the whole ring in one shot and must cover every op kind.
 TEST(NetOpReactorStopTest, CancelsOutstandingAcceptAndConnectInstead) {
     ioenvironment.with_iomgr(iomgr_params{.num_threads = 2});
     IOReactor* reactor{nullptr};
     iomanager.run_on_wait(reactor_regex::random_worker, [&reactor]() { reactor = iomanager.this_reactor(); });
 
     auto const [listen_fd, path] = make_listening_socket();
-    // Heap-allocated and deliberately leaked, same reasoning as CancelsOutstandingRecvInstead: its
-    // destructor would try to dispatch onto `reactor`, which is about to stop.
-    auto* const listener = new listener_handle(listen_fd, thread_specifier{reactor});
+    auto* const listener = new listener_handle(listen_fd, thread_specifier{reactor}); // leaked; see above
 
     accept_result accept_res{-1};
     bool accept_completed{false};
@@ -1084,16 +1023,9 @@ TEST(NetOpReactorStopTest, CancelsOutstandingAcceptAndConnectInstead) {
     ::unlink(path.c_str());
 }
 
-// The scenario behind this whole file's "does the combined case work" question, but for shutdown
-// specifically: a disk write and a net recv both genuinely outstanding on the same reactor, and the
-// reactor stops out from under both at once. IOReactor::stop() runs each attached interface's
-// on_reactor_stop in registration order (general, then net, then drive -- see iomgr.cpp), so
-// UringNetInterface::drain_outstanding_ops() and UringDriveInterface::drain_outstanding_ios() run
-// sequentially, each against its own ring with its own independent 5s deadline (not a shared budget --
-// worth knowing operationally, even though it isn't a correctness bug). What this actually checks: that
-// doesn't hang, and both resolve. The net recv is guaranteed to resolve via cancellation (nothing ever
-// writes to unblock it); the disk write may resolve via normal completion or cancellation depending on
-// exactly how far it got before stop() ran -- either is an acceptable outcome, only hanging isn't.
+// A disk write and a net recv both outstanding on the same reactor when it stops. Checks only that
+// neither hangs: the net recv must resolve via cancellation (nothing ever unblocks it), while the disk
+// write may resolve via normal completion or cancellation depending on timing -- either is acceptable.
 TEST(NetOpReactorStopTest, CancelsOutstandingDiskAndNetIOInstead) {
     ioenvironment.with_iomgr(iomgr_params{.num_threads = 1});
     std::string const dev_path = "/tmp/iomgr_net_op_test_drive_stop_" + std::to_string(::getpid());
@@ -1111,9 +1043,7 @@ TEST(NetOpReactorStopTest, CancelsOutstandingDiskAndNetIOInstead) {
     iomanager.run_on_wait(reactor_regex::random_worker, [&reactor]() { reactor = iomanager.this_reactor(); });
 
     auto const [fd0, fd1] = make_connected_pair();
-    // Heap-allocated and deliberately leaked, same reasoning as the other NetOpReactorStopTest cases:
-    // its destructor would try to dispatch onto `reactor`, which is about to stop.
-    auto* const sock = new socket_handle(fd0, thread_specifier{reactor});
+    auto* const sock = new socket_handle(fd0, thread_specifier{reactor}); // leaked; see above
     std::array< uint8_t, 5 > read_buf{};
     std::array< char, 4096 > write_buf{};
 
@@ -1169,18 +1099,10 @@ void trigger_second_concurrent_recv() {
 }
 } // namespace
 
-// Verifies the protocol-violation guard actually fires rather than silently misbehaving: two logical recv
-// loops racing the same socket_handle concurrently (the realistic version of this bug -- a caller forgets
-// to serialize their own recv loop, or two code paths both think they own the same socket) must abort,
-// not corrupt the parked-pointer slot. "threadsafe" style: this process is multi-threaded (worker
-// reactors), and the default fork-only death test style is documented as unsafe there -- threadsafe
-// re-execs the whole test binary for the death-test statement instead of forking the live process.
-//
-// Matched on the termination signal (RELEASE_ASSERT calls abort(), raising SIGABRT), not the log message:
-// confirmed the actual assert fires (critical-level log for "a second recv is already parked" visible on
-// this run), but sisl's logging sink doesn't end up in the stream gtest's death-test runner captures and
-// matches regexes against, so text matching isn't reliable here. Signal matching only needs the process
-// to have actually died the expected way, not where its log output went.
+// Two recv loops racing the same socket_handle concurrently must abort, not corrupt the parked-pointer
+// slot. "threadsafe" death-test style is required since this process is multi-threaded (worker reactors).
+// Matched on SIGABRT rather than the log message: sisl's logging sink isn't captured by gtest's
+// death-test runner, so text matching isn't reliable here.
 TEST(NetOpDeathTest, SecondConcurrentRecvOnSameSocketAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_EXIT(trigger_second_concurrent_recv(), ::testing::KilledBySignal(SIGABRT), "");

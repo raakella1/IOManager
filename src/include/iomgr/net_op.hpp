@@ -38,27 +38,23 @@ class net_op;
 class accept_op;
 
 // Owns one fd's reactor registration for its whole life; construct once per socket, never per operation.
-// Holds at most one parked recv waiter and one parked send waiter -- serialize your own recv loop and your
-// own send loop. Every net_op call on a handle must run on the reactor it was constructed on, for the
-// handle's whole life, except construction and destruction: those may run on any thread (they hop onto the
-// target/owning reactor themselves), since teardown can legitimately be triggered from another thread.
+// Holds at most one parked recv waiter and one parked send waiter, so callers must serialize their own
+// recv and send loops. All net_op calls on a handle must run on the reactor it was constructed with;
+// construction and destruction may run on any thread and hop onto that reactor internally.
 //
-// Every live socket_handle (and listener_handle) MUST be destroyed before its owning reactor stops.
-// Destruction hops onto that reactor to run teardown, the same as construction; once the reactor has
-// actually stopped, there is nothing left to hop onto. This is not merely slow or a leak -- confirmed
-// empirically under stress testing, it can corrupt the reactor object the dispatch reaches for mid-
-// teardown ("pure virtual method called" is the typical symptom), not just hang. Callers that manage many
-// handles should track and explicitly release them before calling IOManager::stop(), the same way timers
-// and other per-reactor resources already must be.
+// Must be destroyed before its owning reactor stops: destruction also hops onto that reactor, and once
+// the reactor has stopped there is nothing to hop onto. Doing so is undefined behavior -- it can corrupt
+// the reactor object mid-teardown (typically a pure-virtual-call crash), not just leak or hang. Callers
+// holding many handles must release them before IOManager::stop(), as with timers and other per-reactor
+// resources.
 class socket_handle {
 public:
     struct impl;
 
     // Registers fd on the given reactor. Safe to call from any thread.
     socket_handle(int fd, thread_specifier const& reactor);
-    // Cancels any parked waiter (waiting for the kernel's confirmation before touching the fd further),
-    // fails it with connection_aborted, then closes fd. Safe to call from any thread -- but only while the
-    // owning reactor is still running; see the class comment above.
+    // Cancels any parked waiter with connection_aborted, then closes fd. Safe to call from any thread, but
+    // only while the owning reactor is still running; see the class comment above.
     ~socket_handle();
     socket_handle(socket_handle&&) noexcept;
     socket_handle& operator=(socket_handle&&) noexcept;
@@ -79,10 +75,10 @@ private:
 //     iomgr::io_result r = co_await iomgr::async_recv(sock, buf);
 //
 // `await_ready()` retries the syscall itself before touching any parked-waiter state, so an already-ready
-// fd never suspends. A recv returning zero bytes is the peer's orderly shutdown, an ordinary io_result{0}
-// -- distinct from EAGAIN, which suspends and never reaches await_resume() as a value. May complete having
-// moved fewer bytes than requested, same as a raw non-blocking socket always can. Must be driven entirely
-// on the handle's owning reactor thread.
+// fd never suspends. A recv returning zero bytes is the peer's orderly shutdown (io_result{0}), distinct
+// from EAGAIN, which suspends instead of reaching await_resume(). May complete with fewer bytes than
+// requested, same as a raw non-blocking socket. Must be driven entirely on the handle's owning reactor
+// thread.
 class net_op {
 public:
     struct impl;
@@ -106,9 +102,8 @@ net_op async_recv(socket_handle& sock, std::span< uint8_t > buf);
 net_op async_send(socket_handle& sock, std::span< uint8_t const > buf);
 
 // Fire-and-forget launcher for non-coroutine callers: launches `op` and invokes `on_done(result)` on sock's
-// owning reactor thread when it completes. No sync_wait(net_op): a socket_handle is pinned to one reactor
-// for its life, so there's no second reactor to block-wait through without risking deadlocking the one
-// thread that has to make the operation progress.
+// owning reactor thread when it completes. No sync_wait(net_op): blocking the owning reactor's thread
+// would deadlock the only thread that can make the operation progress.
 void detach(net_op op, std::function< void(io_result) > on_done);
 
 // Loops async_recv/async_send until buf is fully consumed. A short read (peer closed before buf filled) or
@@ -118,9 +113,8 @@ void detach(net_op op, std::function< void(io_result) > on_done);
 sisl::async::light_task< io_result > recv_exact(socket_handle& sock, std::span< uint8_t > buf);
 sisl::async::light_task< io_result > send_all(socket_handle& sock, std::span< uint8_t const > buf);
 
-// Owns one listening fd's reactor registration for its whole life, mirroring socket_handle. Holds at most
-// one parked accept waiter; construction and destruction may run on any thread, same as socket_handle --
-// and the same "destroy before the owning reactor stops" requirement applies; see socket_handle's comment.
+// Owns one listening fd's reactor registration for its whole life, mirroring socket_handle, including the
+// "destroy before the owning reactor stops" requirement; see socket_handle's comment.
 class listener_handle {
 public:
     struct impl;
@@ -139,9 +133,8 @@ private:
     std::unique_ptr< impl > _impl;
 };
 
-// accept has no partial-transfer case, so it gets its own result type rather than overloading io_result's
-// byte count to mean "the accepted fd". The returned fd is unregistered: wrap it in its own socket_handle
-// on whichever reactor it should be placed on.
+// accept has no partial-transfer case, so it gets its own result type instead of overloading io_result's
+// byte count as "the accepted fd". The returned fd is unregistered; wrap it in its own socket_handle.
 using accept_result = std::expected< int, std::error_condition >;
 
 class accept_op {
@@ -165,9 +158,9 @@ private:
 
 accept_op async_accept(listener_handle& listener);
 
-// Bare, handle-less awaitable for a single outbound connect -- unlike socket_handle/listener_handle,
-// there's no persistent owner to cancel this through: a connect happens once per fd, not repeatedly, so
-// there's nothing to serialize or tear down. Same opaque PIMPL shape as net_op/accept_op otherwise.
+// Bare, handle-less awaitable for a single outbound connect: a connect happens once per fd, so unlike
+// socket_handle/listener_handle there's no persistent owner and nothing to serialize or tear down. Same
+// opaque PIMPL shape as net_op/accept_op otherwise.
 class connect_op {
 public:
     struct impl;
@@ -188,15 +181,12 @@ private:
 };
 
 // Connects `fd` (already created via ::socket(), not yet connected) to addr/addrlen on `reactor`, backed
-// by a one-shot IORING_OP_CONNECT. Async for the same reason accept is: a stalled peer can leave a
-// blocking ::connect() hanging for a long time (Linux's default connect timeout is on the order of 100+
-// seconds), stalling every other coroutine sharing the issuing reactor thread -- a real problem at
-// hundreds-of-connections scale with reconnect logic, not a hypothetical one.
+// by a one-shot IORING_OP_CONNECT. Async because a blocking ::connect() to a stalled peer can hang for
+// Linux's default connect timeout (100+ seconds), stalling every other coroutine on that reactor thread.
 //
-// Unlike recv/send/accept, there's no owning handle whose teardown could cancel this on the caller's
-// behalf, so `timeout` is the only way to bound the wait: it arms a linked IORING_OP_LINK_TIMEOUT,
-// surfacing as std::errc::timed_out if it fires first. Omitting it waits indefinitely, same as
-// accept/recv/send today.
+// Unlike recv/send/accept, there's no owning handle whose teardown can cancel this, so `timeout` is the
+// only way to bound the wait: it arms a linked IORING_OP_LINK_TIMEOUT, surfacing as std::errc::timed_out
+// if it fires first. Omitting it waits indefinitely.
 connect_op async_connect(int fd, sockaddr const* addr, socklen_t addrlen, thread_specifier const& reactor,
                          std::optional< std::chrono::milliseconds > timeout = std::nullopt);
 

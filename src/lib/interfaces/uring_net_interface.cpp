@@ -29,9 +29,8 @@ namespace iomgr {
 thread_local uring_net_channel* UringNetInterface::t_uring_net_ch{nullptr};
 
 uring_net_channel::uring_net_channel(UringNetInterface* iface) : m_sched{&m_ring} {
-    // iomgr_params::net_uring_qdepth (0 = unset) takes precedence over the dynamic config default: it's
-    // explicit per-instance state set fresh on every IOManager::start(), vs. the process-wide dynamic
-    // config singleton that a caller may not have touched at all for this workload shape.
+    // iomgr_params::net_uring_qdepth (0 = unset) takes precedence over the process-wide dynamic config
+    // default.
     auto const qdepth =
         (iomanager.m_net_uring_qdepth != 0) ? iomanager.m_net_uring_qdepth : IM_DYNAMIC_CONFIG(net.uring_per_thread_qdepth);
 
@@ -101,14 +100,10 @@ void UringNetInterface::clear_iface_reactor_context(IOReactor*) {
 void UringNetInterface::drain_outstanding_ops() {
     if (t_uring_net_ch->m_outstanding == 0) { return; }
 
-    // Cancel everything still in flight on this ring in one shot, rather than tracking down each
-    // socket_handle/listener_handle/connect_op's own async_scope individually: IORING_ASYNC_CANCEL_ANY
-    // ignores the normal user_data/fd matching key, and IORING_ASYNC_CANCEL_ALL cancels every matching
-    // request instead of just the first. This cancel's own completion is irrelevant, so its user_data is
-    // left 0 ("unmanaged"), same convention the per-op cancel-on-stop path uses -- poll_once's reap loop
-    // skips any CQE whose user_data isn't one of its own managed cqe_states. Each individual op's own
-    // CQE still arrives as -ECANCELED and resolves through its normal completion path, decrementing
-    // m_outstanding the same way a normal completion would.
+    // Cancel everything still in flight on this ring in one shot: IORING_ASYNC_CANCEL_ANY matches any
+    // request regardless of key, and IORING_ASYNC_CANCEL_ALL cancels all of them, not just the first. The
+    // cancel SQE's own user_data is left 0 ("unmanaged") so poll_once's reap loop ignores its CQE; each
+    // cancelled op's own CQE still arrives as -ECANCELED and completes normally.
     if (auto* const sqe = ::io_uring_get_sqe(t_uring_net_ch->m_sched.ring())) {
         ::io_uring_prep_cancel64(sqe, 0, IORING_ASYNC_CANCEL_ANY | IORING_ASYNC_CANCEL_ALL);
         ::io_uring_sqe_set_data64(sqe, 0);

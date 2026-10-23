@@ -63,8 +63,8 @@ struct uring_drive_channel {
     ::io_uring m_ring{};
     sisl::async::io_uring_scheduler m_sched; // wraps &m_ring; non-movable
     io_device_ptr m_ring_ev_iodev;
-    uint32_t m_sentinel_idx{0}; // idx returned by attach_iomgr_sentinel_cb, needed to detach on teardown
-    uint64_t m_outstanding{0};  // in-flight drive coroutines on this reactor
+    uint32_t m_sentinel_idx{0};
+    uint64_t m_outstanding{0}; // in-flight drive coroutines on this reactor
 
     uring_drive_channel(UringDriveInterface* iface);
     ~uring_drive_channel();

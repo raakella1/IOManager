@@ -101,25 +101,18 @@ io_result res_to_io_result(int res) {
     return io_result{static_cast< size_t >(res)};
 }
 
-// io_uring_scheduler::async_submit's sender completes via set_error(exception_ptr) (not a negative `res`)
-// when the ring is exhausted even after an internal flush-and-retry (see acquire_sqe/ENOMEM in
-// io_uring_scheduler.hpp) -- a real possibility under load, not a hypothetical, at this queue depth.
-// exec::task's co_await rethrows that into the caller, and exec::async_scope's spawn() is explicitly not
-// built to handle a spawned sender that fails this way ("BUGBUG NOT TO SPEC spawn shouldn't accept
-// senders that can fail" in its own vendored source) -- so this must never be allowed to propagate past
-// the co_await that can throw it. Every submission coroutine below wraps its own co_await in a
-// try/catch(std::exception const&) and maps the caught exception through this.
+// io_uring_scheduler::async_submit's sender completes via set_error(exception_ptr), not a negative `res`,
+// when the ring is exhausted even after its internal flush-and-retry. exec::async_scope::spawn isn't
+// built to handle a spawned sender that fails this way, so every submission coroutine below wraps its
+// co_await in try/catch(std::exception const&) and converts through this instead of letting it propagate.
 std::error_condition exception_to_error_condition(std::exception const& e) {
     if (auto const* se = dynamic_cast< std::system_error const* >(&e)) { return se->code().default_error_condition(); }
     return std::make_error_condition(std::errc::not_enough_memory);
 }
 
 // Outstanding accounting + tight-poll while a net op is in flight, mirroring UringDriveInterface's
-// io_started()/io_finished(): lets UringNetInterface's reactor-stop drain know when it's safe to tear the
-// ring down, and keeps completions flushing promptly while anything is outstanding. Routed through the
-// reactor's own ref-counted enter/exit_tight_poll (shared with drive's identical need) rather than saving
-// the interval locally here -- see IOReactor::enter_tight_poll's comment for why a reactor doing both
-// disk and net I/O needs this to be shared, not two independent save/restore pairs.
+// io_started()/io_finished(); see IOReactor::enter_tight_poll for why this goes through the reactor's
+// shared refcount instead of a local save/restore.
 void net_io_started() {
     auto* const ch = UringNetInterface::this_channel();
     if (ch->m_outstanding++ == 0) { iomanager.this_reactor()->enter_tight_poll(); }
@@ -223,15 +216,11 @@ void complete_parked(Impl*& slot, Result r) {
     if (auto w = op->waiter) { w.resume(); }
 }
 
-// Submits the one-shot recv/send SQE for `self` and, once reaped, completes it -- unless teardown already
-// claimed it via cancellation. Spawned into the owning socket_handle's async_scope, which is what gives
-// teardown a stop token to cancel this specific op (and only this socket's ops) with.
-//
-// If the scope's stop token fires mid-flight, co_await-ing the uring submit sender completes this
-// coroutine via the stopped channel rather than resuming past the co_await -- so the completion below
-// never runs. The RAII guard below covers that path: its destructor runs during that unwind the same way
-// it would during a normal stack unwind, and resolves the parked op as cancelled if nothing else already
-// did.
+// Submits the one-shot recv/send SQE for `self` and, once reaped, completes it, unless teardown already
+// claimed it via cancellation. Spawned into the owning socket_handle's async_scope, so a stop request
+// cancels only this socket's ops. If the stop token fires mid-flight, co_await on the submit sender
+// completes via the stopped channel instead of resuming past it, skipping the completion below -- the
+// cancel_guard's destructor covers that unwind and resolves the op as cancelled if nothing else did.
 exec::task< void > run_uring_op(net_op::impl* self) {
     net_io_scope io_scope;
     struct cancel_guard {
@@ -272,12 +261,11 @@ exec::task< void > run_uring_op(net_op::impl* self) {
     guard.completed = true;
 }
 
-// Cancels and waits for anything still parked on `s`, then closes the fd. Waiting is a bounded manual
-// poll_once loop (same shape as UringDriveInterface's drain_outstanding_ios), not a blocking sender await:
-// this runs synchronously on the owning reactor thread, and reaping the cancellation's completion is only
-// possible by driving that same thread's net channel -- there's no other thread that could do it instead.
-// Unlike disk I/O, a parked accept/recv can hang forever if the peer never sends/connects, so this must
-// actively cancel rather than passively wait for "nothing outstanding" the way drive's drain does.
+// Cancels and waits for anything still parked on `s`, then closes the fd. Runs on the owning reactor
+// thread, so waiting is a bounded manual poll_once loop rather than a blocking await -- no other thread
+// can drive this reactor's net channel to reap the cancellation. Unlike disk I/O, a parked accept/recv can
+// hang forever if the peer never sends/connects, so this actively cancels instead of passively waiting for
+// "nothing outstanding" the way drive's drain does.
 void teardown(socket_handle::impl& s) {
     if (s.parked_recv || s.parked_send) {
         s.scope.request_stop();
@@ -324,10 +312,7 @@ exec::task< void > run_uring_accept(accept_op::impl* self) {
             guard.completed = true;
             co_return;
         }
-        // ECONNABORTED: the peer reset the connection between its SYN completing and accept() picking it
-        // up -- retry rather than fail the whole listener over one aborted connection, same reasoning as
-        // the raw-syscall fast path in try_accept.
-        if (res != -EINTR && res != -ECONNABORTED) { break; }
+        if (res != -EINTR && res != -ECONNABORTED) { break; } // see try_accept for why ECONNABORTED retries
     }
 
     accept_op::impl*& slot = self->owner->parked_accept;
@@ -360,16 +345,12 @@ void teardown(listener_handle::impl& s) {
 }
 
 // One-shot IORING_OP_CONNECT, optionally linked (IOSQE_IO_LINK) to an IORING_OP_LINK_TIMEOUT so the
-// kernel itself cancels the connect if it fires first -- rather than racing a second sender/coroutine
-// against this one, which would need to keep touching `self` after this task (and the connect_op it
-// belongs to) may already be gone. The timeout SQE's own completion is irrelevant here, so its user_data
-// is left 0 ("unmanaged"), same convention submit_op's own cancel-on-stop path uses: poll_once's reap
-// loop skips any CQE whose user_data isn't one of its own managed cqe_states.
+// kernel cancels the connect if it fires first, rather than racing a second sender against `self` after
+// its connect_op may already be gone. The timeout SQE's user_data is left 0 ("unmanaged"), same convention
+// as elsewhere, so poll_once's reap loop ignores its CQE.
 //
-// addr/ts are coroutine-frame locals (addr a parameter, ts local), not references to caller-owned
-// storage: the kernel reads them at actual submission time, deferred to the next poll_once, not at this
-// prep call -- same hazard as drive's own legacy iovec path. The frame stays alive across the suspend,
-// so this is safe.
+// addr/ts are coroutine-frame locals, not references to caller-owned storage: the kernel reads them at
+// actual submission time (deferred to the next poll_once), and the frame stays alive across the suspend.
 exec::task< void > run_uring_connect(connect_op::impl* self, int fd, sockaddr_storage addr, socklen_t addrlen,
                                      std::optional< std::chrono::milliseconds > timeout) {
     net_io_scope io_scope;
@@ -409,9 +390,8 @@ exec::task< void > run_uring_connect(connect_op::impl* self, int fd, sockaddr_st
             }
         });
     } catch (std::exception const& e) {
-        // Not retried (unlike recv/send/accept): connect has no EINTR-safe resubmission path -- a second
-        // connect() on a fd that may already be mid-handshake risks the same EALREADY net_op.hpp's
-        // await_ready documents for why there's no raw-syscall fast path here either.
+        // Not retried: a second connect() on an already-mid-handshake fd risks EALREADY; see
+        // connect_op::await_ready below for why there's no raw-syscall fast path either.
         if (!self->done) {
             self->result = std::unexpected(exception_to_error_condition(e));
             self->done = true;
@@ -445,10 +425,7 @@ socket_handle::socket_handle(int fd, thread_specifier const& reactor) : _impl{st
     });
 }
 
-// Must run before the owning reactor stops: run_on_reactor's dispatch has nothing to deliver the message
-// to once that reactor's thread has exited. Confirmed under stress testing to actually corrupt the
-// (already-destructing) reactor object the dispatch reaches for, not just hang -- see net_op.hpp's class
-// comment.
+// Must run before the owning reactor stops; see net_op.hpp's class comment.
 socket_handle::~socket_handle() {
     if (!_impl) { return; } // moved-from
     impl* const p = _impl.get();
@@ -546,13 +523,10 @@ connect_op::connect_op(connect_op&&) noexcept = default;
 connect_op& connect_op::operator=(connect_op&&) noexcept = default;
 connect_op::~connect_op() = default;
 
-// Unlike recv/send/accept, connect has no safe fast path: trying a raw non-blocking ::connect() first
-// (as those do) would itself start the handshake (that's what EINPROGRESS means -- the kernel is now
-// actively connecting), and a *second* connect -- including IORING_OP_CONNECT's own internal connect()
-// syscall -- on an already-connecting fd is rejected outright with EALREADY, confirmed empirically. So
-// IORING_OP_CONNECT must be the only connect() call ever made on this fd; go straight to the uring
-// submission every time. A connect that completes quickly (loopback in particular) still resolves fast
-// this way, just via one ring round trip rather than zero.
+// Unlike recv/send/accept, connect has no safe fast path: a raw non-blocking ::connect() would itself
+// start the handshake (EINPROGRESS), and a second connect() on an already-connecting fd -- including
+// IORING_OP_CONNECT's own internal one -- is rejected with EALREADY. So IORING_OP_CONNECT must be the
+// only connect() call ever made on this fd; go straight to uring submission every time.
 bool connect_op::await_ready() const noexcept { return false; }
 
 void connect_op::await_suspend(std::coroutine_handle<> h) noexcept {
